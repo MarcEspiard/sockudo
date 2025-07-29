@@ -172,10 +172,29 @@ impl RateLimiter for RedisRateLimiter {
     async fn disconnect(&self) -> Result<()> {
         // Note: Redis MultiplexedConnection doesn't have an explicit disconnect method
         // The connection will be dropped when the client goes out of scope
-        // This method is provided for interface compatibility and future cleanup needs
-        tracing::debug!(
-            "RedisRateLimiter disconnect called - connection will be dropped on struct drop"
-        );
+        // However, we can try to send a QUIT command to cleanly close the connection
+        tracing::debug!("RedisRateLimiter disconnect called - attempting clean shutdown");
+
+        // Try to send QUIT command with a timeout to avoid hanging
+        let mut conn = self.connection.clone();
+        let quit_timeout = Duration::from_millis(1000); // 1 second timeout
+
+        let quit_result = tokio::time::timeout(quit_timeout, async move {
+            let _: std::result::Result<(), redis::RedisError> =
+                redis::cmd("QUIT").query_async(&mut conn).await;
+        })
+        .await;
+
+        match quit_result {
+            Ok(_) => {
+                tracing::debug!("Redis QUIT command sent successfully");
+            }
+            Err(_) => {
+                tracing::warn!("Redis QUIT command timed out - forcing disconnect");
+            }
+        }
+
+        tracing::debug!("RedisRateLimiter disconnect completed");
         Ok(())
     }
 }

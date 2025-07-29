@@ -1013,7 +1013,17 @@ impl SockudoServer {
     async fn stop(&self) -> Result<()> {
         info!("Stopping server...");
         debug!("Setting running flag to false to signal other tasks to stop");
-        self.state.running.store(false, Ordering::SeqCst); // Signal other tasks to stop
+
+        // Signal all tasks to stop
+        let was_running = self.state.running.swap(false, Ordering::SeqCst);
+        debug!("Running flag changed from {} to false", was_running);
+
+        // Log current adapter type to understand what might be holding the lock
+        debug!(
+            "Server configured with adapter driver: {:?}",
+            self.config.adapter.driver
+        );
+        debug!("Rate limiter driver: {:?}", self.config.rate_limiter.driver);
 
         // Wrap the entire shutdown process in a timeout to prevent hanging
         let shutdown_timeout = Duration::from_secs(30); // Give 30 seconds for complete shutdown
@@ -1037,6 +1047,11 @@ impl SockudoServer {
     }
 
     async fn perform_shutdown(&self) -> Result<()> {
+        // Give background tasks a moment to notice the running flag change and stop
+        debug!("Allowing background tasks to notice shutdown signal...");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        debug!("Proceeding with connection cleanup");
+
         let mut connections_to_cleanup: Vec<(String, WebSocketRef)> = Vec::new();
 
         // --- Step 1: Collect all connection identifiers ---
@@ -1141,15 +1156,36 @@ impl SockudoServer {
         // Disconnect from backend services
         debug!("Starting backend services disconnection");
 
-        // Check if connection manager adapter needs disconnection
-        debug!("Checking if connection manager adapter needs disconnection");
-        {
-            let connection_manager = self.state.connection_manager.lock().await;
-            debug!("Connection manager adapter type: checking for Redis connections");
-            // Note: Adapter doesn't have a disconnect method but may hold Redis connections
-            debug!(
-                "Note: Connection manager adapter has no disconnect method - potential hang if using Redis adapter"
-            );
+        // Attempt to disconnect connection manager adapter with timeout
+        debug!("Attempting to acquire connection manager lock for adapter disconnection");
+        let adapter_disconnect_timeout = Duration::from_secs(5);
+        let adapter_lock_result = tokio::time::timeout(
+            adapter_disconnect_timeout,
+            self.state.connection_manager.lock(),
+        )
+        .await;
+
+        match adapter_lock_result {
+            Ok(connection_manager) => {
+                debug!("Connection manager lock acquired for adapter disconnection");
+                debug!("Connection manager adapter type: checking for Redis connections");
+                // Note: Adapter doesn't have a disconnect method but may hold Redis connections
+                debug!(
+                    "Note: Connection manager adapter has no disconnect method - potential hang if using Redis adapter"
+                );
+                // Explicitly drop the lock
+                drop(connection_manager);
+                debug!("Connection manager lock released after adapter check");
+            }
+            Err(_) => {
+                error!(
+                    "ADAPTER DEADLOCK: Could not acquire connection manager lock for adapter disconnection within {} seconds",
+                    adapter_disconnect_timeout.as_secs()
+                );
+                error!(
+                    "Skipping adapter disconnection - this confirms the connection manager is deadlocked"
+                );
+            }
         }
 
         {

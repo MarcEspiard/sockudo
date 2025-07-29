@@ -103,4 +103,7 @@ pub trait ConnectionManager: Send + Sync {
     async fn get_sockets_count(&mut self, app_id: &str) -> Result<usize>;
     async fn get_namespaces(&mut self) -> Result<DashMap<String, Arc<Namespace>>>;
     fn as_any_mut(&mut self) -> &mut dyn Any;
+    
+    /// Disconnect and cleanup all resources (pubsub connections, background tasks, etc.)
+    async fn disconnect(&mut self) -> Result<()>;
 }

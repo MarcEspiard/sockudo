@@ -26,6 +26,8 @@ use crate::metrics::MetricsInterface;
 use crate::namespace::Namespace;
 use crate::protocol::messages::PusherMessage;
 use crate::websocket::{SocketId, WebSocketRef};
+use crate::utils::ShutdownSignal;
+use tokio::task::JoinHandle;
 
 /// Redis channels
 pub const DEFAULT_PREFIX: &str = "sockudo";
@@ -70,6 +72,8 @@ pub struct RedisAdapter {
     pub request_channel: String,
     pub response_channel: String,
     pub config: RedisAdapterConfig,
+    pub shutdown_signal: Option<ShutdownSignal>,
+    pub pubsub_task_handle: Option<JoinHandle<()>>,
 }
 
 impl RedisAdapter {
@@ -100,6 +104,8 @@ impl RedisAdapter {
             request_channel,
             response_channel,
             config,
+            shutdown_signal: None,
+            pubsub_task_handle: None,
         })
     }
 
@@ -118,6 +124,10 @@ impl RedisAdapter {
         let mut horizontal = self.horizontal.lock().await;
         horizontal.metrics = Some(metrics);
         Ok(())
+    }
+
+    pub fn set_shutdown_signal(&mut self, shutdown_signal: ShutdownSignal) {
+        self.shutdown_signal = Some(shutdown_signal);
     }
 
     /// Enhanced send_request that properly integrates with HorizontalAdapter
@@ -298,17 +308,18 @@ impl RedisAdapter {
         Ok(())
     }
 
-    pub async fn start_listeners(&self) -> Result<()> {
+    pub async fn start_listeners(&mut self) -> Result<()> {
         {
             let mut horizontal = self.horizontal.lock().await;
             horizontal.start_request_cleanup();
         }
 
-        self.start_listeners_pubsub().await?;
+        let handle = self.start_listeners_pubsub(self.shutdown_signal.clone()).await?;
+        self.pubsub_task_handle = Some(handle);
         Ok(())
     }
 
-    async fn start_listeners_pubsub(&self) -> Result<()> {
+    async fn start_listeners_pubsub(&self, shutdown_signal: Option<ShutdownSignal>) -> Result<JoinHandle<()>> {
         let sub_client = self.client.clone();
         let horizontal_arc = self.horizontal.clone();
         let pub_connection = self.connection.clone();
@@ -321,7 +332,7 @@ impl RedisAdapter {
             horizontal_lock.node_id.clone()
         };
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut pubsub = match sub_client.get_async_pubsub().await {
                 Ok(pubsub) => pubsub,
                 Err(e) => {
@@ -347,87 +358,108 @@ impl RedisAdapter {
 
             let mut message_stream = pubsub.on_message();
 
-            while let Some(msg) = message_stream.next().await {
-                let channel: String = msg.get_channel_name().to_string();
-                let payload_result: redis::RedisResult<String> = msg.get_payload();
+            loop {
+                tokio::select! {
+                    // Check for shutdown signal
+                    _ = async {
+                        if let Some(ref signal) = shutdown_signal {
+                            signal.wait_for_shutdown().await;
+                        } else {
+                            // If no shutdown signal, wait indefinitely
+                            let _: () = std::future::pending().await;
+                        }
+                    } => {
+                        info!("Redis pubsub listener received shutdown signal");
+                        break;
+                    }
+                    // Process incoming messages
+                    msg_opt = message_stream.next() => {
+                        let Some(msg) = msg_opt else {
+                            warn!("Redis pubsub message stream ended");
+                            break;
+                        };
+                        let channel: String = msg.get_channel_name().to_string();
+                        let payload_result: redis::RedisResult<String> = msg.get_payload();
 
-                if let Ok(payload) = payload_result {
-                    let horizontal_clone = horizontal_arc.clone();
-                    let node_id_clone = node_id.clone();
-                    let pub_connection_clone = pub_connection.clone();
-                    let broadcast_channel_clone = broadcast_channel.clone();
-                    let request_channel_clone = request_channel.clone();
-                    let response_channel_clone = response_channel.clone();
+                        if let Ok(payload) = payload_result {
+                            let horizontal_clone = horizontal_arc.clone();
+                            let node_id_clone = node_id.clone();
+                            let pub_connection_clone = pub_connection.clone();
+                            let broadcast_channel_clone = broadcast_channel.clone();
+                            let request_channel_clone = request_channel.clone();
+                            let response_channel_clone = response_channel.clone();
 
-                    tokio::spawn(async move {
-                        if channel == broadcast_channel_clone {
-                            // Handle broadcast message
-                            if let Ok(broadcast) =
-                                serde_json::from_str::<BroadcastMessage>(&payload)
-                            {
-                                if broadcast.node_id == node_id_clone {
-                                    return;
-                                }
+                            tokio::spawn(async move {
+                                if channel == broadcast_channel_clone {
+                                    // Handle broadcast message
+                                    if let Ok(broadcast) =
+                                        serde_json::from_str::<BroadcastMessage>(&payload)
+                                    {
+                                        if broadcast.node_id == node_id_clone {
+                                            return;
+                                        }
 
-                                if let Ok(message) = serde_json::from_str(&broadcast.message) {
-                                    let except_id = broadcast
-                                        .except_socket_id
-                                        .as_ref()
-                                        .map(|id| SocketId(id.clone()));
+                                        if let Ok(message) = serde_json::from_str(&broadcast.message) {
+                                            let except_id = broadcast
+                                                .except_socket_id
+                                                .as_ref()
+                                                .map(|id| SocketId(id.clone()));
 
-                                    let mut horizontal_lock = horizontal_clone.lock().await;
-                                    let _ = horizontal_lock
-                                        .local_adapter
-                                        .send(
-                                            &broadcast.channel,
-                                            message,
-                                            except_id.as_ref(),
-                                            &broadcast.app_id,
-                                        )
-                                        .await;
-                                }
-                            }
-                        } else if channel == request_channel_clone {
-                            // Handle request message
-                            if let Ok(request) = serde_json::from_str::<RequestBody>(&payload) {
-                                if request.node_id == node_id_clone {
-                                    return;
-                                }
+                                            let mut horizontal_lock = horizontal_clone.lock().await;
+                                            let _ = horizontal_lock
+                                                .local_adapter
+                                                .send(
+                                                    &broadcast.channel,
+                                                    message,
+                                                    except_id.as_ref(),
+                                                    &broadcast.app_id,
+                                                )
+                                                .await;
+                                        }
+                                    }
+                                } else if channel == request_channel_clone {
+                                    // Handle request message
+                                    if let Ok(request) = serde_json::from_str::<RequestBody>(&payload) {
+                                        if request.node_id == node_id_clone {
+                                            return;
+                                        }
 
-                                let response = {
-                                    let mut horizontal_lock = horizontal_clone.lock().await;
-                                    horizontal_lock.process_request(request).await
-                                };
+                                        let response = {
+                                            let mut horizontal_lock = horizontal_clone.lock().await;
+                                            horizontal_lock.process_request(request).await
+                                        };
 
-                                if let Ok(response) = response {
-                                    if let Ok(response_json) = serde_json::to_string(&response) {
-                                        let mut conn = pub_connection_clone.clone();
-                                        let _ = conn
-                                            .publish::<_, _, ()>(
-                                                &response_channel_clone,
-                                                response_json,
-                                            )
-                                            .await;
+                                        if let Ok(response) = response {
+                                            if let Ok(response_json) = serde_json::to_string(&response) {
+                                                let mut conn = pub_connection_clone.clone();
+                                                let _ = conn
+                                                    .publish::<_, _, ()>(
+                                                        &response_channel_clone,
+                                                        response_json,
+                                                    )
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                } else if channel == response_channel_clone {
+                                    // Handle response message
+                                    if let Ok(response) = serde_json::from_str::<ResponseBody>(&payload) {
+                                        if response.node_id == node_id_clone {
+                                            return;
+                                        }
+
+                                        let horizontal_lock = horizontal_clone.lock().await;
+                                        let _ = horizontal_lock.process_response(response).await;
                                     }
                                 }
-                            }
-                        } else if channel == response_channel_clone {
-                            // Handle response message
-                            if let Ok(response) = serde_json::from_str::<ResponseBody>(&payload) {
-                                if response.node_id == node_id_clone {
-                                    return;
-                                }
-
-                                let horizontal_lock = horizontal_clone.lock().await;
-                                let _ = horizontal_lock.process_response(response).await;
-                            }
+                            });
                         }
-                    });
+                    }
                 }
             }
         });
 
-        Ok(())
+        Ok(handle)
     }
 
     pub async fn get_node_count(&self) -> Result<usize> {
@@ -870,5 +902,39 @@ impl ConnectionManager for RedisAdapter {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+
+    async fn disconnect(&mut self) -> Result<()> {
+        info!("Disconnecting Redis adapter");
+        
+        // Signal shutdown to background tasks
+        if let Some(ref signal) = self.shutdown_signal {
+            signal.shutdown();
+        }
+
+        // Wait for pubsub task to complete if it exists
+        if let Some(handle) = self.pubsub_task_handle.take() {
+            match tokio::time::timeout(std::time::Duration::from_secs(3), handle).await {
+                Ok(join_result) => {
+                    if let Err(e) = join_result {
+                        if !e.is_cancelled() {
+                            warn!("Redis pubsub task completed with error: {}", e);
+                        }
+                    }
+                }
+                Err(_) => {
+                    warn!("Redis pubsub task did not complete within timeout, may still be running");
+                }
+            }
+        }
+
+        // Disconnect from local adapter
+        {
+            let mut horizontal = self.horizontal.lock().await;
+            horizontal.local_adapter.disconnect().await?;
+        }
+
+        info!("Redis adapter disconnected successfully");
+        Ok(())
     }
 }

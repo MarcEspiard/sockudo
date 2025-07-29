@@ -6,6 +6,7 @@ use crate::error::{Error, Result};
 use crate::queue::manager::{QueueManager, QueueManagerFactory};
 use crate::webhook::sender::WebhookSender;
 use crate::webhook::types::{JobData, JobPayload};
+use crate::utils::ShutdownSignal;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -15,7 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::interval;
-use tracing::{error, info};
+use tokio::task::JoinHandle;
+use tracing::{error, info, warn};
 
 /// Configuration for the webhook integration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +73,8 @@ pub struct WebhookIntegration {
     batched_webhooks: Arc<Mutex<HashMap<String, Vec<JobData>>>>,
     queue_manager: Option<Arc<Mutex<QueueManager>>>,
     app_manager: Arc<dyn AppManager + Send + Sync>,
+    shutdown_signal: Option<ShutdownSignal>,
+    batching_task_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl WebhookIntegration {
@@ -83,12 +87,18 @@ impl WebhookIntegration {
             batched_webhooks: Arc::new(Mutex::new(HashMap::new())),
             queue_manager: None,
             app_manager,
+            shutdown_signal: None,
+            batching_task_handle: Arc::new(Mutex::new(None)),
         };
 
         if integration.config.enabled {
             integration.init_queue_manager().await?;
         }
         Ok(integration)
+    }
+
+    pub fn set_shutdown_signal(&mut self, shutdown_signal: ShutdownSignal) {
+        self.shutdown_signal = Some(shutdown_signal);
     }
 
     async fn init_queue_manager(&mut self) -> Result<()> {
@@ -136,45 +146,106 @@ impl WebhookIntegration {
         let queue_manager_clone = self.queue_manager.clone();
         let batched_webhooks_clone = self.batched_webhooks.clone();
         let batch_duration = self.config.batching.duration;
+        let shutdown_signal = self.shutdown_signal.clone();
+        let task_handle = self.batching_task_handle.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut interval = interval(Duration::from_millis(batch_duration));
+            
             loop {
-                interval.tick().await;
-                let webhooks_to_process: HashMap<String, Vec<JobData>> = {
-                    let mut batched = batched_webhooks_clone.lock().await;
-                    std::mem::take(&mut *batched)
-                };
+                tokio::select! {
+                    // Check for shutdown signal
+                    _ = async {
+                        if let Some(ref signal) = shutdown_signal {
+                            signal.wait_for_shutdown().await;
+                        } else {
+                            let _: () = std::future::pending().await;
+                        }
+                    } => {
+                        info!("Webhook batching task received shutdown signal");
+                        break;
+                    }
+                    // Process batched webhooks
+                    _ = interval.tick() => {
+                        let webhooks_to_process: HashMap<String, Vec<JobData>> = {
+                            let mut batched = batched_webhooks_clone.lock().await;
+                            std::mem::take(&mut *batched)
+                        };
 
-                if webhooks_to_process.is_empty() {
-                    continue;
-                }
-                info!(
-                    "{}",
-                    format!(
-                        "Processing {} batched webhook queues (Sockudo internal batching)",
-                        webhooks_to_process.len()
-                    )
-                );
+                        if webhooks_to_process.is_empty() {
+                            continue;
+                        }
+                        info!(
+                            "{}",
+                            format!(
+                                "Processing {} batched webhook queues (Sockudo internal batching)",
+                                webhooks_to_process.len()
+                            )
+                        );
 
-                if let Some(manager_arc) = &queue_manager_clone {
-                    for (queue_name, jobs) in webhooks_to_process {
-                        let manager_locked = manager_arc.lock().await;
-                        for job in jobs {
-                            if let Err(e) = manager_locked.add_to_queue(&queue_name, job).await {
-                                error!(
-                                    "{}",
-                                    format!(
-                                        "Failed to add batched job to queue {}: {}",
-                                        queue_name, e
-                                    )
-                                );
+                        if let Some(manager_arc) = &queue_manager_clone {
+                            for (queue_name, jobs) in webhooks_to_process {
+                                let manager_locked = manager_arc.lock().await;
+                                for job in jobs {
+                                    if let Err(e) = manager_locked.add_to_queue(&queue_name, job).await {
+                                        error!(
+                                            "{}",
+                                            format!(
+                                                "Failed to add batched job to queue {}: {}",
+                                                queue_name, e
+                                            )
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
+            info!("Webhook batching task shut down");
         });
+
+        // Store the handle
+        if let Ok(mut task) = task_handle.try_lock() {
+            *task = Some(handle);
+        }
+    }
+
+    pub async fn disconnect(&self) -> Result<()> {
+        info!("Disconnecting webhook integration");
+
+        // Signal shutdown to batching task
+        if let Some(ref signal) = self.shutdown_signal {
+            signal.shutdown();
+        }
+
+        // Wait for the batching task to complete
+        {
+            let mut task_guard = self.batching_task_handle.lock().await;
+            if let Some(handle) = task_guard.take() {
+                match tokio::time::timeout(Duration::from_secs(3), handle).await {
+                    Ok(join_result) => {
+                        if let Err(e) = join_result {
+                            if !e.is_cancelled() {
+                                warn!("Webhook batching task completed with error: {}", e);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        warn!("Webhook batching task did not complete within timeout");
+                    }
+                }
+            }
+        }
+
+        // Disconnect queue manager
+        if let Some(manager_arc) = &self.queue_manager {
+            let manager = manager_arc.lock().await;
+            manager.disconnect().await?;
+        }
+
+        info!("Webhook integration disconnected successfully");
+        Ok(())
     }
 
     pub fn is_enabled(&self) -> bool {

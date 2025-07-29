@@ -3,6 +3,7 @@ use crate::error::{Error, Result};
 use crate::options::SqsQueueConfig; // Use the struct from options.rs
 use crate::queue::{ArcJobProcessorFn, QueueInterface};
 use crate::webhook::sender::JobProcessorFnAsync;
+use crate::utils::ShutdownSignal;
 use async_trait::async_trait;
 use aws_sdk_sqs as sqs;
 use std::collections::HashMap;
@@ -10,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::interval;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// SQS-based implementation of the QueueInterface
 pub struct SqsQueueManager {
@@ -24,8 +25,8 @@ pub struct SqsQueueManager {
     queue_urls: Arc<Mutex<HashMap<String, String>>>,
     /// Active workers
     worker_handles: Arc<Mutex<HashMap<String, Vec<tokio::task::JoinHandle<()>>>>>,
-    /// Flag to control worker shutdown
-    shutdown: Arc<Mutex<bool>>,
+    /// Shutdown signal for graceful termination
+    shutdown_signal: Option<ShutdownSignal>,
 }
 
 impl SqsQueueManager {
@@ -54,8 +55,12 @@ impl SqsQueueManager {
             config,
             queue_urls: Arc::new(Mutex::new(HashMap::new())),
             worker_handles: Arc::new(Mutex::new(HashMap::new())),
-            shutdown: Arc::new(Mutex::new(false)),
+            shutdown_signal: None,
         })
+    }
+
+    pub fn set_shutdown_signal(&mut self, shutdown_signal: ShutdownSignal) {
+        self.shutdown_signal = Some(shutdown_signal);
     }
 
     /// Get or create the URL for a queue
@@ -193,7 +198,7 @@ impl SqsQueueManager {
         // Clone values needed for the worker
         let client = self.client.clone();
         let config = self.config.clone();
-        let shutdown = self.shutdown.clone();
+        let shutdown_signal = self.shutdown_signal.clone();
         let queue_name = queue_name.to_string();
 
         // Spawn the worker task
@@ -209,19 +214,23 @@ impl SqsQueueManager {
             let mut interval = interval(Duration::from_secs(1));
 
             loop {
-                interval.tick().await;
-
-                // Check if we should shutdown
-                if *shutdown.lock().await {
-                    info!(
-                        "{}",
-                        format!(
-                            "SQS worker #{} for queue {} shutting down",
+                tokio::select! {
+                    // Check for shutdown signal
+                    _ = async {
+                        if let Some(ref signal) = shutdown_signal {
+                            signal.wait_for_shutdown().await;
+                        } else {
+                            let _: () = std::future::pending().await;
+                        }
+                    } => {
+                        info!(
+                            "SQS worker #{} for queue {} received shutdown signal",
                             worker_id, queue_name
-                        )
-                    );
-                    break;
-                }
+                        );
+                        break;
+                    }
+                    // Process jobs
+                    _ = interval.tick() => {
 
                 // Receive messages from the queue
                 let result = client
@@ -340,7 +349,10 @@ impl SqsQueueManager {
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 }
+                    }
+                }
             }
+            info!("SQS worker #{} for queue {} shut down", worker_id, queue_name);
         })
     }
 }
@@ -435,10 +447,11 @@ impl QueueInterface for SqsQueueManager {
 
     /// Disconnect and clean up
     async fn disconnect(&self) -> Result<()> {
+        info!("Disconnecting SQS queue manager");
+
         // Signal workers to shutdown
-        {
-            let mut shutdown = self.shutdown.lock().await;
-            *shutdown = true;
+        if let Some(ref signal) = self.shutdown_signal {
+            signal.shutdown();
         }
 
         // Wait for workers to finish
@@ -451,13 +464,23 @@ impl QueueInterface for SqsQueueManager {
                 );
 
                 for handle in workers {
-                    // We don't want to await here as it could block indefinitely
-                    // Just detach the tasks and let them complete on their own
-                    handle.abort();
+                    match tokio::time::timeout(Duration::from_secs(3), handle).await {
+                        Ok(join_result) => {
+                            if let Err(e) = join_result {
+                                if !e.is_cancelled() {
+                                    warn!("SQS worker completed with error: {}", e);
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            warn!("SQS worker did not complete within timeout");
+                        }
+                    }
                 }
             }
         }
 
+        info!("SQS queue manager disconnected successfully");
         Ok(())
     }
 }
@@ -465,11 +488,8 @@ impl QueueInterface for SqsQueueManager {
 impl Drop for SqsQueueManager {
     fn drop(&mut self) {
         // Signal workers to shutdown when the manager is dropped
-        // We can't use async functions in drop, so we spawn a task
-        let shutdown = self.shutdown.clone();
-        tokio::spawn(async move {
-            let mut lock = shutdown.lock().await;
-            *lock = true;
-        });
+        if let Some(ref signal) = self.shutdown_signal {
+            signal.shutdown();
+        }
     }
 }

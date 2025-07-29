@@ -883,4 +883,18 @@ impl ConnectionManager for RedisClusterAdapter {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+
+    async fn disconnect(&mut self) -> Result<()> {
+        info!("Disconnecting Redis Cluster adapter");
+        
+        // For now, just disconnect the local adapter
+        // TODO: Add proper Redis cluster pubsub shutdown when implemented
+        {
+            let mut horizontal = self.horizontal.lock().await;
+            horizontal.local_adapter.disconnect().await?;
+        }
+
+        info!("Redis Cluster adapter disconnected successfully");
+        Ok(())
+    }
 }

@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::WriteHalf;
 use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Clone)]
 pub struct LocalAdapter {
@@ -348,5 +348,29 @@ impl ConnectionManager for LocalAdapter {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+
+    async fn disconnect(&mut self) -> Result<()> {
+        info!("Disconnecting local adapter - closing all connections");
+        
+        // Close all WebSocket connections properly
+        for namespace_entry in self.namespaces.iter() {
+            let namespace = namespace_entry.value();
+            let sockets = namespace.sockets.clone();
+            
+            // Close all sockets in this namespace
+            for socket_entry in sockets.iter() {
+                let ws_ref = socket_entry.value();
+                if let Err(e) = ws_ref.close(1001, "Server shutting down".to_string()).await {
+                    warn!("Failed to close WebSocket connection: {}", e);
+                }
+            }
+        }
+        
+        // Clear all namespaces
+        self.namespaces.clear();
+        
+        info!("Local adapter disconnected successfully");
+        Ok(())
     }
 }

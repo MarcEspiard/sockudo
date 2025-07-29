@@ -30,7 +30,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use async_nats::rustls::crypto::CryptoProvider;
 use axum::http::Method;
 use axum::http::header::HeaderName;
 use axum::http::uri::Authority;
@@ -92,6 +91,7 @@ use crate::cache::memory_cache_manager::MemoryCacheManager; // Import for fallba
 use crate::metrics::MetricsInterface;
 use crate::middleware::pusher_api_auth_middleware;
 use crate::websocket::WebSocketRef;
+use crate::utils::{ShutdownSignal, TaskManager};
 
 /// Server state containing all managers
 struct ServerState {
@@ -106,6 +106,7 @@ struct ServerState {
     running: AtomicBool,
     http_api_rate_limiter: Option<Arc<dyn RateLimiter + Send + Sync>>,
     debug_enabled: bool,
+    shutdown_signal: ShutdownSignal,
 }
 
 /// Main server struct
@@ -113,6 +114,7 @@ struct SockudoServer {
     config: ServerOptions,
     state: ServerState,
     handler: Arc<ConnectionHandler>,
+    task_manager: TaskManager,
 }
 
 #[derive(Parser, Debug)]
@@ -375,6 +377,8 @@ impl SockudoServer {
             }
         };
 
+        let shutdown_signal = ShutdownSignal::new();
+        
         let state = ServerState {
             app_manager: app_manager.clone(),
             channel_manager: channel_manager.clone(),
@@ -387,6 +391,7 @@ impl SockudoServer {
             running: AtomicBool::new(true),
             http_api_rate_limiter: Some(http_api_rate_limiter_instance.clone()),
             debug_enabled,
+            shutdown_signal: shutdown_signal.clone(),
         };
 
         let handler = Arc::new(ConnectionHandler::new(
@@ -451,10 +456,38 @@ impl SockudoServer {
                 }
             }
         }
+
+        // Set shutdown signal for adapters that support it
+        {
+            let mut connection_manager_guard = state.connection_manager.lock().await;
+            let adapter_as_any: &mut dyn std::any::Any = connection_manager_guard.as_any_mut();
+
+            match config.adapter.driver {
+                AdapterDriver::Redis => {
+                    if let Some(adapter_mut) = adapter_as_any.downcast_mut::<RedisAdapter>() {
+                        adapter_mut.set_shutdown_signal(shutdown_signal.clone());
+                        info!("Set shutdown signal for RedisAdapter");
+                    }
+                }
+                AdapterDriver::Nats => {
+                    if let Some(adapter_mut) = adapter_as_any.downcast_mut::<NatsAdapter>() {
+                        adapter_mut.set_shutdown_signal(shutdown_signal.clone());
+                        info!("Set shutdown signal for NatsAdapter");
+                    }
+                }
+                _ => {
+                    // Local and other adapters don't need explicit shutdown signals
+                }
+            }
+        }
+
+        let task_manager = TaskManager::new(shutdown_signal);
+
         Ok(Self {
             config,
             state,
             handler,
+            task_manager,
         })
     }
 
@@ -1004,9 +1037,17 @@ impl SockudoServer {
         // The actual .stop() is called after server.start() returns in main
     }
 
-    async fn stop(&self) -> Result<()> {
+    async fn stop(&mut self) -> Result<()> {
         info!("Stopping server...");
         self.state.running.store(false, Ordering::SeqCst); // Signal other tasks to stop
+
+        // --- Step 0: Signal shutdown to all background tasks ---
+        info!("Signaling shutdown to all background tasks");
+        self.state.shutdown_signal.shutdown();
+
+        // Shutdown task manager with timeout
+        let shutdown_timeout = Duration::from_secs(5);
+        self.task_manager.shutdown_all(shutdown_timeout).await;
 
         let mut connections_to_cleanup: Vec<(String, WebSocketRef)> = Vec::new();
 
@@ -1089,6 +1130,15 @@ impl SockudoServer {
                 warn!("Error disconnecting queue manager: {}", e);
             }
         }
+        
+        // Disconnect connection manager (adapters)
+        {
+            let mut connection_manager_locked = self.state.connection_manager.lock().await;
+            if let Err(e) = connection_manager_locked.disconnect().await {
+                warn!("Error disconnecting connection manager: {}", e);
+            }
+        }
+        
         // Add disconnect for app_manager if it has such a method
         // self.state.app_manager.disconnect().await?;
 
@@ -1426,7 +1476,7 @@ async fn main() -> Result<()> {
     // --- Part 3: Rest of the application logic ---
     info!("Starting Sockudo server initialization process with resolved configuration...");
 
-    let server = match SockudoServer::new(config).await {
+    let mut server = match SockudoServer::new(config).await {
         // Pass the fully resolved config
         Ok(s) => s,
         Err(e) => {

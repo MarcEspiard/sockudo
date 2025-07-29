@@ -27,6 +27,8 @@ use crate::namespace::Namespace;
 pub(crate) use crate::options::NatsAdapterConfig;
 use crate::protocol::messages::PusherMessage;
 use crate::websocket::{SocketId, WebSocketRef};
+use crate::utils::ShutdownSignal;
+use tokio::task::JoinHandle;
 
 /// NATS channels/subjects
 pub const DEFAULT_PREFIX: &str = "sockudo";
@@ -43,6 +45,8 @@ pub struct NatsAdapter {
     pub request_subject: String,
     pub response_subject: String,
     pub config: NatsAdapterConfig,
+    pub shutdown_signal: Option<ShutdownSignal>,
+    pub task_handles: Vec<JoinHandle<()>>,
 }
 
 impl NatsAdapter {
@@ -88,6 +92,8 @@ impl NatsAdapter {
             request_subject,
             response_subject,
             config,
+            shutdown_signal: None,
+            task_handles: Vec::new(),
         })
     }
 
@@ -106,6 +112,10 @@ impl NatsAdapter {
         let mut horizontal = self.horizontal.lock().await;
         horizontal.metrics = Some(metrics);
         Ok(())
+    }
+
+    pub fn set_shutdown_signal(&mut self, shutdown_signal: ShutdownSignal) {
+        self.shutdown_signal = Some(shutdown_signal);
     }
 
     /// Enhanced send_request that properly integrates with HorizontalAdapter
@@ -838,5 +848,40 @@ impl ConnectionManager for NatsAdapter {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+
+    async fn disconnect(&mut self) -> Result<()> {
+        info!("Disconnecting NATS adapter");
+        
+        // Signal shutdown to background tasks
+        if let Some(ref signal) = self.shutdown_signal {
+            signal.shutdown();
+        }
+
+        // Wait for all task handles to complete
+        let handles = std::mem::take(&mut self.task_handles);
+        for handle in handles {
+            match tokio::time::timeout(std::time::Duration::from_secs(3), handle).await {
+                Ok(join_result) => {
+                    if let Err(e) = join_result {
+                        if !e.is_cancelled() {
+                            warn!("NATS task completed with error: {}", e);
+                        }
+                    }
+                }
+                Err(_) => {
+                    warn!("NATS task did not complete within timeout, may still be running");
+                }
+            }
+        }
+
+        // Disconnect from local adapter
+        {
+            let mut horizontal = self.horizontal.lock().await;
+            horizontal.local_adapter.disconnect().await?;
+        }
+
+        info!("NATS adapter disconnected successfully");
+        Ok(())
     }
 }

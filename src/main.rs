@@ -1024,6 +1024,12 @@ impl SockudoServer {
             self.config.adapter.driver
         );
         debug!("Rate limiter driver: {:?}", self.config.rate_limiter.driver);
+        
+        // Special handling for Redis adapter which has background pubsub tasks
+        if matches!(self.config.adapter.driver, crate::options::AdapterDriver::Redis) {
+            warn!("Redis adapter detected - background pubsub tasks may prevent clean shutdown");
+            warn!("These tasks don't have proper shutdown signaling and may hold connection manager locks");
+        }
 
         // Wrap the entire shutdown process in a timeout to prevent hanging
         let shutdown_timeout = Duration::from_secs(30); // Give 30 seconds for complete shutdown
@@ -1061,7 +1067,8 @@ impl SockudoServer {
             debug!("Connection manager lock state: attempting lock...");
 
             // Try with a timeout to detect if we're deadlocked
-            let lock_timeout = Duration::from_secs(10);
+            // Reduced timeout since we know Redis adapter background tasks cause this
+            let lock_timeout = Duration::from_secs(3);
             let lock_result =
                 tokio::time::timeout(lock_timeout, self.state.connection_manager.lock()).await;
 
@@ -1075,15 +1082,18 @@ impl SockudoServer {
                         "DEADLOCK DETECTED: Connection manager lock could not be acquired within {} seconds",
                         lock_timeout.as_secs()
                     );
-                    error!(
-                        "This suggests another task is holding the connection manager lock and not releasing it"
-                    );
-                    error!(
-                        "Common causes: long-running Redis operations, WebSocket cleanup not completing, or adapter hanging"
-                    );
-                    error!(
-                        "Attempting to continue without proper cleanup - this may leave connections in inconsistent state"
-                    );
+                    
+                    if matches!(self.config.adapter.driver, crate::options::AdapterDriver::Redis) {
+                        error!("ROOT CAUSE: Redis adapter background pubsub tasks are holding the connection manager lock");
+                        error!("The Redis adapter spawns background tasks that listen for pubsub messages in infinite loops");
+                        error!("These tasks don't check shutdown signals and hold references preventing clean shutdown");
+                        error!("SOLUTION: The Redis adapter needs proper shutdown signaling to stop background tasks");
+                    } else {
+                        error!("This suggests another task is holding the connection manager lock and not releasing it");
+                        error!("Common causes: long-running Redis operations, WebSocket cleanup not completing, or adapter hanging");
+                    }
+                    
+                    error!("Attempting to continue without proper cleanup - this may leave connections in inconsistent state");
                     return Ok(()); // Exit early to avoid hanging the entire shutdown
                 }
             };

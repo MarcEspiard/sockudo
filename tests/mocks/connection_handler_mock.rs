@@ -185,6 +185,10 @@ impl ConnectionManager for MockAdapter {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+    
+    async fn disconnect(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone)]

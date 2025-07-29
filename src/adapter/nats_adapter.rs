@@ -46,7 +46,7 @@ pub struct NatsAdapter {
     pub response_subject: String,
     pub config: NatsAdapterConfig,
     pub shutdown_signal: Option<ShutdownSignal>,
-    pub task_handles: Vec<JoinHandle<()>>,
+    pub task_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl NatsAdapter {
@@ -93,7 +93,7 @@ impl NatsAdapter {
             response_subject,
             config,
             shutdown_signal: None,
-            task_handles: Vec::new(),
+            task_handles: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -310,6 +310,8 @@ impl NatsAdapter {
         let broadcast_subject = self.broadcast_subject.clone();
         let request_subject = self.request_subject.clone();
         let response_subject = self.response_subject.clone();
+        let task_handles = self.task_handles.clone();
+        let shutdown_signal = self.shutdown_signal.clone();
 
         let node_id = {
             let horizontal_lock = horizontal_arc.lock().await;
@@ -348,29 +350,50 @@ impl NatsAdapter {
         // Spawn a task to handle broadcast messages
         let broadcast_horizontal = horizontal_arc.clone();
         let broadcast_node_id = node_id.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = broadcast_subscription.next().await {
-                if let Ok(broadcast) = serde_json::from_slice::<BroadcastMessage>(&msg.payload) {
-                    if broadcast.node_id == broadcast_node_id {
-                        continue;
+        let broadcast_shutdown = shutdown_signal.clone();
+        let broadcast_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    // Check for shutdown signal
+                    _ = async {
+                        if let Some(ref signal) = broadcast_shutdown {
+                            signal.wait_for_shutdown().await;
+                        } else {
+                            let _: () = std::future::pending().await;
+                        }
+                    } => {
+                        info!("NATS broadcast listener received shutdown signal");
+                        break;
                     }
+                    // Process incoming messages
+                    msg_opt = broadcast_subscription.next() => {
+                        let Some(msg) = msg_opt else {
+                            warn!("NATS broadcast subscription ended");
+                            break;
+                        };
+                        if let Ok(broadcast) = serde_json::from_slice::<BroadcastMessage>(&msg.payload) {
+                            if broadcast.node_id == broadcast_node_id {
+                                continue;
+                            }
 
-                    if let Ok(message) = serde_json::from_str(&broadcast.message) {
-                        let except_id = broadcast
-                            .except_socket_id
-                            .as_ref()
-                            .map(|id| SocketId(id.clone()));
+                            if let Ok(message) = serde_json::from_str(&broadcast.message) {
+                                let except_id = broadcast
+                                    .except_socket_id
+                                    .as_ref()
+                                    .map(|id| SocketId(id.clone()));
 
-                        let mut horizontal_lock = broadcast_horizontal.lock().await;
-                        let _ = horizontal_lock
-                            .local_adapter
-                            .send(
-                                &broadcast.channel,
-                                message,
-                                except_id.as_ref(),
-                                &broadcast.app_id,
-                            )
-                            .await;
+                                let mut horizontal_lock = broadcast_horizontal.lock().await;
+                                let _ = horizontal_lock
+                                    .local_adapter
+                                    .send(
+                                        &broadcast.channel,
+                                        message,
+                                        except_id.as_ref(),
+                                        &broadcast.app_id,
+                                    )
+                                    .await;
+                            }
+                        }
                     }
                 }
             }
@@ -381,26 +404,47 @@ impl NatsAdapter {
         let request_node_id = node_id.clone();
         let request_client = nats_client.clone();
         let request_response_subject = response_subject.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = request_subscription.next().await {
-                if let Ok(request) = serde_json::from_slice::<RequestBody>(&msg.payload) {
-                    if request.node_id == request_node_id {
-                        continue;
+        let request_shutdown = shutdown_signal.clone();
+        let request_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    // Check for shutdown signal
+                    _ = async {
+                        if let Some(ref signal) = request_shutdown {
+                            signal.wait_for_shutdown().await;
+                        } else {
+                            let _: () = std::future::pending().await;
+                        }
+                    } => {
+                        info!("NATS request listener received shutdown signal");
+                        break;
                     }
+                    // Process incoming messages
+                    msg_opt = request_subscription.next() => {
+                        let Some(msg) = msg_opt else {
+                            warn!("NATS request subscription ended");
+                            break;
+                        };
+                        if let Ok(request) = serde_json::from_slice::<RequestBody>(&msg.payload) {
+                            if request.node_id == request_node_id {
+                                continue;
+                            }
 
-                    let response = {
-                        let mut horizontal_lock = request_horizontal.lock().await;
-                        horizontal_lock.process_request(request).await
-                    };
+                            let response = {
+                                let mut horizontal_lock = request_horizontal.lock().await;
+                                horizontal_lock.process_request(request).await
+                            };
 
-                    if let Ok(response) = response {
-                        if let Ok(response_data) = serde_json::to_vec(&response) {
-                            let _ = request_client
-                                .publish(
-                                    Subject::from(request_response_subject.clone()),
-                                    response_data.into(),
-                                )
-                                .await;
+                            if let Ok(response) = response {
+                                if let Ok(response_data) = serde_json::to_vec(&response) {
+                                    let _ = request_client
+                                        .publish(
+                                            Subject::from(request_response_subject.clone()),
+                                            response_data.into(),
+                                        )
+                                        .await;
+                                }
+                            }
                         }
                     }
                 }
@@ -410,18 +454,47 @@ impl NatsAdapter {
         // Spawn a task to handle response messages
         let response_horizontal = horizontal_arc.clone();
         let response_node_id = node_id.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = response_subscription.next().await {
-                if let Ok(response) = serde_json::from_slice::<ResponseBody>(&msg.payload) {
-                    if response.node_id == response_node_id {
-                        continue;
+        let response_shutdown = shutdown_signal.clone();
+        let response_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    // Check for shutdown signal
+                    _ = async {
+                        if let Some(ref signal) = response_shutdown {
+                            signal.wait_for_shutdown().await;
+                        } else {
+                            let _: () = std::future::pending().await;
+                        }
+                    } => {
+                        info!("NATS response listener received shutdown signal");
+                        break;
                     }
+                    // Process incoming messages
+                    msg_opt = response_subscription.next() => {
+                        let Some(msg) = msg_opt else {
+                            warn!("NATS response subscription ended");
+                            break;
+                        };
+                        if let Ok(response) = serde_json::from_slice::<ResponseBody>(&msg.payload) {
+                            if response.node_id == response_node_id {
+                                continue;
+                            }
 
-                    let horizontal_lock = response_horizontal.lock().await;
-                    let _ = horizontal_lock.process_response(response).await;
+                            let horizontal_lock = response_horizontal.lock().await;
+                            let _ = horizontal_lock.process_response(response).await;
+                        }
+                    }
                 }
             }
         });
+
+        // Store all task handles for proper shutdown
+        {
+            let mut handles = task_handles.lock().await;
+            handles.push(broadcast_handle);
+            handles.push(request_handle);
+            handles.push(response_handle);
+        }
 
         Ok(())
     }
@@ -859,7 +932,10 @@ impl ConnectionManager for NatsAdapter {
         }
 
         // Wait for all task handles to complete
-        let handles = std::mem::take(&mut self.task_handles);
+        let handles = {
+            let mut task_handles = self.task_handles.lock().await;
+            std::mem::take(&mut *task_handles)
+        };
         for handle in handles {
             match tokio::time::timeout(std::time::Duration::from_secs(3), handle).await {
                 Ok(join_result) => {

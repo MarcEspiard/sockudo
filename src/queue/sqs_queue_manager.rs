@@ -445,6 +445,10 @@ impl QueueInterface for SqsQueueManager {
         Ok(())
     }
 
+    fn set_shutdown_signal(&mut self, shutdown_signal: ShutdownSignal) {
+        self.shutdown_signal = Some(shutdown_signal);
+    }
+
     /// Disconnect and clean up
     async fn disconnect(&self) -> Result<()> {
         info!("Disconnecting SQS queue manager");

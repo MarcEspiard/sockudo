@@ -232,6 +232,10 @@ impl QueueInterface for RedisClusterQueueManager {
         Ok(())
     }
 
+    fn set_shutdown_signal(&mut self, shutdown_signal: ShutdownSignal) {
+        self.shutdown_signal = Some(shutdown_signal);
+    }
+
     async fn disconnect(&self) -> crate::error::Result<()> {
         info!("Disconnecting Redis cluster queue manager");
 

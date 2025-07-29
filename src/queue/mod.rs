@@ -1,4 +1,5 @@
 use crate::error::Result;
+use crate::utils::ShutdownSignal;
 use crate::webhook::sender::JobProcessorFnAsync;
 use crate::webhook::types::JobData;
 use async_trait::async_trait;
@@ -36,4 +37,7 @@ pub trait QueueInterface: Send + Sync {
         callback: JobProcessorFnAsync,
     ) -> crate::error::Result<()>;
     async fn disconnect(&self) -> crate::error::Result<()>;
+    
+    /// Set shutdown signal for graceful termination of background tasks
+    fn set_shutdown_signal(&mut self, shutdown_signal: ShutdownSignal);
 }

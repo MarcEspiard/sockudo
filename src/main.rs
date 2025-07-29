@@ -181,6 +181,9 @@ impl SockudoServer {
         )));
         let auth_validator = Arc::new(AuthValidator::new(app_manager.clone()));
 
+        // Create shutdown signal early so it can be passed to components that need it
+        let shutdown_signal = ShutdownSignal::new();
+
         let metrics = if config.metrics.enabled {
             info!(
                 "Initializing metrics with driver: {:?}",
@@ -301,11 +304,12 @@ impl SockudoServer {
                     _ => (None, "sockudo_queue:", 5), // Default fallback
                 };
 
-            match QueueManagerFactory::create(
+            match QueueManagerFactory::create_with_shutdown_signal(
                 config.queue.driver.as_ref(),
                 queue_redis_url_or_nodes.as_deref(),
                 Some(queue_prefix),
                 Some(queue_concurrency),
+                Some(shutdown_signal.clone()),
             )
             .await
             {
@@ -352,14 +356,15 @@ impl SockudoServer {
             debug: config.debug,
         };
 
-        let webhook_integration = match WebhookIntegration::new(
+        let webhook_integration = match WebhookIntegration::new_with_shutdown_signal(
             webhook_config_for_integration,
             app_manager.clone(),
+            Some(shutdown_signal.clone()),
         )
         .await
         {
             Ok(integration) => {
-                info!("Webhook integration initialized successfully");
+                info!("Webhook integration initialized successfully with shutdown signal");
                 Arc::new(integration)
             }
             Err(e) => {
@@ -373,12 +378,10 @@ impl SockudoServer {
                     ..Default::default() // Use default for other fields
                 };
                 // This should not fail if enabled is false
-                Arc::new(WebhookIntegration::new(disabled_config, app_manager.clone()).await?)
+                Arc::new(WebhookIntegration::new_with_shutdown_signal(disabled_config, app_manager.clone(), Some(shutdown_signal.clone())).await?)
             }
         };
 
-        let shutdown_signal = ShutdownSignal::new();
-        
         let state = ServerState {
             app_manager: app_manager.clone(),
             channel_manager: channel_manager.clone(),
@@ -475,11 +478,19 @@ impl SockudoServer {
                         info!("Set shutdown signal for NatsAdapter");
                     }
                 }
+                AdapterDriver::RedisCluster => {
+                    if let Some(adapter_mut) = adapter_as_any.downcast_mut::<RedisClusterAdapter>() {
+                        adapter_mut.set_shutdown_signal(shutdown_signal.clone());
+                        info!("Set shutdown signal for RedisClusterAdapter");
+                    }
+                }
                 _ => {
                     // Local and other adapters don't need explicit shutdown signals
                 }
             }
         }
+
+        // Webhook integration shutdown signal is now set during creation
 
         let task_manager = TaskManager::new(shutdown_signal);
 

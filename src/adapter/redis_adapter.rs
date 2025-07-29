@@ -311,6 +311,9 @@ impl RedisAdapter {
     pub async fn start_listeners(&mut self) -> Result<()> {
         {
             let mut horizontal = self.horizontal.lock().await;
+            if let Some(ref signal) = self.shutdown_signal {
+                horizontal.set_shutdown_signal(signal.clone());
+            }
             horizontal.start_request_cleanup();
         }
 

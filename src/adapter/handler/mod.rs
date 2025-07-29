@@ -439,14 +439,18 @@ impl ConnectionHandler {
         metrics: &dyn MetricsInterface,
     ) {
         // Get current count for this channel type
-        let current_count = self.get_active_channel_count_for_type(app_id, channel_type).await;
-        
+        let current_count = self
+            .get_active_channel_count_for_type(app_id, channel_type)
+            .await;
+
         // Increment by 1
         metrics.update_active_channels(app_id, channel_type, current_count + 1);
-        
+
         debug!(
             "Incremented active {} channels for app {} to {}",
-            channel_type, app_id, current_count + 1
+            channel_type,
+            app_id,
+            current_count + 1
         );
     }
 
@@ -458,12 +462,14 @@ impl ConnectionHandler {
         metrics: &dyn MetricsInterface,
     ) {
         // Get current count for this channel type
-        let current_count = self.get_active_channel_count_for_type(app_id, channel_type).await;
-        
+        let current_count = self
+            .get_active_channel_count_for_type(app_id, channel_type)
+            .await;
+
         // Decrement by 1, but never go below 0
         let new_count = std::cmp::max(0, current_count - 1);
         metrics.update_active_channels(app_id, channel_type, new_count);
-        
+
         debug!(
             "Decremented active {} channels for app {} to {}",
             channel_type, app_id, new_count
@@ -472,11 +478,27 @@ impl ConnectionHandler {
 
     /// Get the current count of active channels for a specific type
     async fn get_active_channel_count_for_type(&self, app_id: &str, channel_type: &str) -> i64 {
-        // Get all channels with their socket counts
-        let channels_map = match self.connection_manager.lock().await.get_channels_with_socket_count(app_id).await {
-            Ok(map) => map,
-            Err(e) => {
-                error!("Failed to get channels for metrics update: {}", e);
+        // Add timeout protection to prevent deadlock during shutdown
+        let lock_timeout = std::time::Duration::from_secs(2);
+        let channels_map = match tokio::time::timeout(lock_timeout, self.connection_manager.lock())
+            .await
+        {
+            Ok(mut connection_manager) => {
+                match connection_manager
+                    .get_channels_with_socket_count(app_id)
+                    .await
+                {
+                    Ok(map) => map,
+                    Err(e) => {
+                        error!("Failed to get channels for metrics update: {}", e);
+                        return 0;
+                    }
+                }
+            }
+            Err(_) => {
+                warn!(
+                    "Timeout acquiring connection manager lock for metrics - server may be shutting down"
+                );
                 return 0;
             }
         };
@@ -486,23 +508,23 @@ impl ConnectionHandler {
         for channel_entry in channels_map.iter() {
             let channel_name = channel_entry.key();
             let socket_count = *channel_entry.value();
-            
+
             // Only count channels that have active connections
             if socket_count > 0 {
                 let ch_type = crate::channel::ChannelType::from_name(channel_name);
                 let ch_type_str = match ch_type {
                     crate::channel::ChannelType::Public => "public",
-                    crate::channel::ChannelType::Private => "private", 
+                    crate::channel::ChannelType::Private => "private",
                     crate::channel::ChannelType::Presence => "presence",
                     crate::channel::ChannelType::PrivateEncrypted => "private_encrypted",
                 };
-                
+
                 if ch_type_str == channel_type {
                     count += 1;
                 }
             }
         }
-        
+
         count
     }
 }

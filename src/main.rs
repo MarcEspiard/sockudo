@@ -71,7 +71,7 @@ use crate::webhook::integration::{BatchingConfig, WebhookConfig, WebhookIntegrat
 use crate::ws_handler::handle_ws_upgrade;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 // Import tracing and tracing_subscriber parts
-use tracing::{error, info, warn}; // Added LevelFilter
+use tracing::{debug, error, info, warn}; // Added LevelFilter
 use tracing_subscriber::{EnvFilter, fmt, util::SubscriberInitExt};
 
 // Import concrete adapter types for downcasting if set_metrics is specific
@@ -1011,6 +1011,7 @@ impl SockudoServer {
 
     async fn stop(&self) -> Result<()> {
         info!("Stopping server...");
+        debug!("Setting running flag to false to signal other tasks to stop");
         self.state.running.store(false, Ordering::SeqCst); // Signal other tasks to stop
 
         let mut connections_to_cleanup: Vec<(String, WebSocketRef)> = Vec::new();
@@ -1018,7 +1019,9 @@ impl SockudoServer {
         // --- Step 1: Collect all connection identifiers ---
         // Scope for the initial lock to quickly gather connection details.
         {
+            debug!("Acquiring connection manager lock for shutdown cleanup");
             let mut connection_manager_guard = self.state.connection_manager.lock().await;
+            debug!("Connection manager lock acquired");
             match connection_manager_guard.get_namespaces().await {
                 Ok(namespaces_vec) => {
                     // Assuming get_namespaces returns an iterable collection
@@ -1052,6 +1055,7 @@ impl SockudoServer {
                 }
             }
         } // connection_manager_guard is dropped here, releasing the main lock.
+        debug!("Connection manager lock released");
 
         info!(
             "Collected {} connections to cleanup.",
@@ -1061,6 +1065,7 @@ impl SockudoServer {
         // --- Step 2: Parallelize Cleanup ---
         // Each cleanup task will briefly re-acquire the lock on ConnectionManager.
         if !connections_to_cleanup.is_empty() {
+            debug!("Starting parallel connection cleanup");
             let cleanup_futures =
                 connections_to_cleanup
                     .into_iter()
@@ -1076,6 +1081,7 @@ impl SockudoServer {
                         }
                     });
 
+            debug!("Waiting for all connection cleanup tasks to complete");
             join_all(cleanup_futures).await;
             info!("All connection cleanup tasks have been processed.");
         } else {
@@ -1083,26 +1089,60 @@ impl SockudoServer {
         }
 
         // Disconnect from backend services
+        debug!("Starting backend services disconnection");
+        
+        // Check if connection manager adapter needs disconnection
+        debug!("Checking if connection manager adapter needs disconnection");
         {
+            let connection_manager = self.state.connection_manager.lock().await;
+            debug!("Connection manager adapter type: checking for Redis connections");
+            // Note: Adapter doesn't have a disconnect method but may hold Redis connections
+            debug!("Note: Connection manager adapter has no disconnect method - potential hang if using Redis adapter");
+        }
+        
+        {
+            debug!("Acquiring cache manager lock for disconnect");
             let mut cache_manager_locked = self.state.cache_manager.lock().await;
+            debug!("Cache manager lock acquired, attempting disconnect");
             if let Err(e) = cache_manager_locked.disconnect().await {
                 warn!("Error disconnecting cache manager: {}", e);
+            } else {
+                debug!("Cache manager disconnected successfully");
             }
         }
+        debug!("Cache manager lock released");
+        
         if let Some(queue_manager_arc) = &self.state.queue_manager {
+            debug!("Disconnecting queue manager");
             if let Err(e) = queue_manager_arc.disconnect().await {
                 warn!("Error disconnecting queue manager: {}", e);
+            } else {
+                debug!("Queue manager disconnected successfully");
             }
         }
+        
+        // Check if rate limiter needs disconnection (Redis/Redis Cluster backends)
+        if let Some(rate_limiter) = &self.state.http_api_rate_limiter {
+            debug!("Checking if HTTP API rate limiter needs disconnection");
+            // Note: Rate limiter doesn't have a disconnect method currently
+            // This might be where Redis connections are hanging
+            debug!("HTTP API rate limiter has no disconnect method - potential hang point if using Redis");
+        }
+        
         // Add disconnect for app_manager if it has such a method
         // self.state.app_manager.disconnect().await?;
+        debug!("Note: App manager does not have disconnect method");
 
         info!(
             "Waiting for shutdown grace period: {} seconds",
             self.config.shutdown_grace_period
         );
+        debug!("Starting shutdown grace period sleep");
         tokio::time::sleep(Duration::from_secs(self.config.shutdown_grace_period)).await;
+        debug!("Shutdown grace period completed");
+        
         info!("Server stopped");
+        debug!("Shutdown process completed, returning from stop()");
         Ok(())
     }
 
@@ -1457,11 +1497,18 @@ async fn main() -> Result<()> {
 
     // This part is reached if server.start() completes without error (e.g., due to shutdown signal)
     info!("Server main services concluded. Performing final shutdown...");
+    debug!("Calling server.stop()");
     if let Err(e) = server.stop().await {
         error!("Error during final server stop: {}", e);
+    } else {
+        debug!("server.stop() completed successfully");
     }
 
     info!("Sockudo server shutdown complete.");
+    debug!("Exiting main function");
+    
+    // Add a final debug message right before the function returns
+    debug!("About to return from main() - if you don't see 'Process exited', check for hanging tokio runtime or background tasks");
     Ok(())
 }
 

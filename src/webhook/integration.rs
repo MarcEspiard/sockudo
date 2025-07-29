@@ -82,12 +82,30 @@ impl WebhookIntegration {
         config: WebhookConfig,
         app_manager: Arc<dyn AppManager + Send + Sync>,
     ) -> Result<Self> {
-        let mut integration = Self {
+        let integration = Self {
             config,
             batched_webhooks: Arc::new(Mutex::new(HashMap::new())),
             queue_manager: None,
             app_manager,
             shutdown_signal: None,
+            batching_task_handle: Arc::new(Mutex::new(None)),
+        };
+
+        // Don't initialize queue manager here - do it after shutdown signal is set
+        Ok(integration)
+    }
+
+    pub async fn new_with_shutdown_signal(
+        config: WebhookConfig,
+        app_manager: Arc<dyn AppManager + Send + Sync>,
+        shutdown_signal: Option<ShutdownSignal>,
+    ) -> Result<Self> {
+        let mut integration = Self {
+            config,
+            batched_webhooks: Arc::new(Mutex::new(HashMap::new())),
+            queue_manager: None,
+            app_manager,
+            shutdown_signal,
             batching_task_handle: Arc::new(Mutex::new(None)),
         };
 
@@ -101,13 +119,15 @@ impl WebhookIntegration {
         self.shutdown_signal = Some(shutdown_signal);
     }
 
+
     async fn init_queue_manager(&mut self) -> Result<()> {
         if self.is_enabled() {
-            let driver = QueueManagerFactory::create(
+            let driver = QueueManagerFactory::create_with_shutdown_signal(
                 &self.config.queue_driver,
                 self.config.redis_url.as_deref(),
                 self.config.redis_prefix.as_deref(),
                 self.config.redis_concurrency,
+                self.shutdown_signal.clone(),
             )
             .await?;
             let queue_manager = Arc::new(Mutex::new(QueueManager::new(driver)));

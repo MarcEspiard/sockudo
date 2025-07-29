@@ -8,12 +8,14 @@ use crate::adapter::ConnectionManager;
 use crate::adapter::local_adapter::LocalAdapter;
 use crate::channel::PresenceMemberInfo;
 use crate::error::{Error, Result};
+use crate::utils::ShutdownSignal;
 
 use crate::metrics::MetricsInterface;
 use crate::websocket::SocketId;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -96,6 +98,12 @@ pub struct HorizontalAdapter {
     pub requests_timeout: u64,
 
     pub metrics: Option<Arc<Mutex<dyn MetricsInterface + Send + Sync>>>,
+    
+    /// Shutdown signal for graceful termination
+    pub shutdown_signal: Option<ShutdownSignal>,
+    
+    /// Cleanup task handle
+    pub cleanup_task_handle: Option<JoinHandle<()>>,
 }
 
 impl HorizontalAdapter {
@@ -107,41 +115,65 @@ impl HorizontalAdapter {
             pending_requests: DashMap::new(),
             requests_timeout: 5000, // Default 5 seconds
             metrics: None,
+            shutdown_signal: None,
+            cleanup_task_handle: None,
         }
+    }
+
+    /// Set shutdown signal for graceful termination
+    pub fn set_shutdown_signal(&mut self, shutdown_signal: ShutdownSignal) {
+        self.shutdown_signal = Some(shutdown_signal);
     }
 
     /// Start the request cleanup task
     pub fn start_request_cleanup(&mut self) {
         // Clone data needed for the task
-        // let node_id = self.node_id.clone();
         let timeout = self.requests_timeout;
         let pending_requests_clone = self.pending_requests.clone();
+        let shutdown_signal = self.shutdown_signal.clone();
 
         // Spawn a background task to clean up stale requests
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             loop {
-                sleep(Duration::from_millis(1000)).await;
+                tokio::select! {
+                    // Check for shutdown signal
+                    _ = async {
+                        if let Some(ref signal) = shutdown_signal {
+                            signal.wait_for_shutdown().await;
+                        } else {
+                            let _: () = std::future::pending().await;
+                        }
+                    } => {
+                        info!("HorizontalAdapter cleanup task received shutdown signal");
+                        break;
+                    }
+                    // Regular cleanup interval
+                    _ = sleep(Duration::from_millis(1000)) => {
+                        // Find and process expired requests
+                        let now = Instant::now();
+                        let mut expired_requests = Vec::new();
 
-                // Find and process expired requests
-                let now = Instant::now();
-                let mut expired_requests = Vec::new();
+                        // We can't modify pending_requests while iterating
+                        for entry in &pending_requests_clone {
+                            let request_id = entry.key();
+                            let request = entry.value();
+                            if now.duration_since(request.start_time).as_millis() > timeout as u128 {
+                                expired_requests.push(request_id.clone());
+                            }
+                        }
 
-                // We can't modify pending_requests while iterating
-                for entry in &pending_requests_clone {
-                    let request_id = entry.key();
-                    let request = entry.value();
-                    if now.duration_since(request.start_time).as_millis() > timeout as u128 {
-                        expired_requests.push(request_id.clone());
+                        // Process expired requests
+                        for request_id in expired_requests {
+                            warn!("{}", format!("Request {} expired", request_id));
+                            pending_requests_clone.remove(&request_id);
+                        }
                     }
                 }
-
-                // Process expired requests
-                for request_id in expired_requests {
-                    warn!("{}", format!("Request {} expired", request_id));
-                    pending_requests_clone.remove(&request_id);
-                }
             }
+            info!("HorizontalAdapter cleanup task shut down");
         });
+
+        self.cleanup_task_handle = Some(handle);
     }
 
     /// Process a received request from another node

@@ -23,6 +23,7 @@ use crate::channel::PresenceMemberInfo;
 use crate::error::{Error, Result};
 use crate::metrics::MetricsInterface;
 use crate::namespace::Namespace;
+use crate::utils::ShutdownSignal;
 pub(crate) use crate::options::RedisClusterAdapterConfig;
 use crate::protocol::messages::PusherMessage;
 use crate::websocket::{SocketId, WebSocketRef};
@@ -43,6 +44,7 @@ pub struct RedisClusterAdapter {
     pub request_channel: String,
     pub response_channel: String,
     pub config: RedisClusterAdapterConfig,
+    pub shutdown_signal: Option<ShutdownSignal>,
 }
 
 impl RedisClusterAdapter {
@@ -71,6 +73,7 @@ impl RedisClusterAdapter {
             request_channel,
             response_channel,
             config,
+            shutdown_signal: None,
         })
     }
 
@@ -89,6 +92,12 @@ impl RedisClusterAdapter {
         let mut horizontal = self.horizontal.lock().await;
         horizontal.metrics = Some(metrics);
         Ok(())
+    }
+
+    pub fn set_shutdown_signal(&mut self, shutdown_signal: ShutdownSignal) {
+        self.shutdown_signal = Some(shutdown_signal.clone());
+        // Also set it on the horizontal adapter
+        // We'll need to do this when we call start_listeners since horizontal is behind Arc<Mutex<>>
     }
 
     /// Enhanced send_request that properly integrates with HorizontalAdapter
@@ -272,6 +281,9 @@ impl RedisClusterAdapter {
     pub async fn start_listeners(&self) -> Result<()> {
         {
             let mut horizontal = self.horizontal.lock().await;
+            if let Some(ref signal) = self.shutdown_signal {
+                horizontal.set_shutdown_signal(signal.clone());
+            }
             horizontal.start_request_cleanup();
         }
 

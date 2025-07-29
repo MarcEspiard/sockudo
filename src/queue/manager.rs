@@ -2,6 +2,7 @@
 // Seems fine, just delegates calls.
 
 use crate::error::Result;
+use crate::utils::ShutdownSignal;
 
 use crate::queue::QueueInterface;
 use crate::queue::memory_queue_manager::MemoryQueueManager;
@@ -22,6 +23,17 @@ impl QueueManagerFactory {
         prefix: Option<&str>,
         concurrency: Option<usize>,
     ) -> Result<Box<dyn QueueInterface>> {
+        Self::create_with_shutdown_signal(driver, redis_url, prefix, concurrency, None).await
+    }
+
+    /// Creates a queue manager instance with an optional shutdown signal
+    pub async fn create_with_shutdown_signal(
+        driver: &str,
+        redis_url: Option<&str>,
+        prefix: Option<&str>,
+        concurrency: Option<usize>,
+        shutdown_signal: Option<ShutdownSignal>,
+    ) -> Result<Box<dyn QueueInterface>> {
         // Return Result to propagate errors
         match driver {
             "redis" => {
@@ -36,7 +48,10 @@ impl QueueManagerFactory {
                     )
                 );
                 // Use `?` to propagate potential errors from RedisQueueManager::new
-                let manager = RedisQueueManager::new(url, prefix_str, concurrency_val).await?;
+                let mut manager = RedisQueueManager::new(url, prefix_str, concurrency_val).await?;
+                if let Some(signal) = shutdown_signal {
+                    manager.set_shutdown_signal(signal);
+                }
                 // Note: Redis workers are started via process_queue, not here.
                 Ok(Box::new(manager))
             }
@@ -58,15 +73,21 @@ impl QueueManagerFactory {
                     )
                 );
 
-                let manager =
+                let mut manager =
                     RedisClusterQueueManager::new(cluster_nodes, prefix_str, concurrency_val)
                         .await?;
+                if let Some(signal) = shutdown_signal {
+                    manager.set_shutdown_signal(signal);
+                }
                 Ok(Box::new(manager))
             }
             "memory" => {
                 // Default to memory queue manager
                 info!("{}", "Creating Memory queue manager".to_string());
-                let manager = MemoryQueueManager::new();
+                let mut manager = MemoryQueueManager::new();
+                if let Some(signal) = shutdown_signal {
+                    manager.set_shutdown_signal(signal);
+                }
                 // Start the single processing loop for the memory manager *after* creation.
                 // The user needs to call process_queue afterwards to register processors.
                 manager.start_processing(); // Start its background task here
@@ -106,5 +127,10 @@ impl QueueManager {
     /// Disconnects the underlying driver (if necessary).
     pub async fn disconnect(&self) -> Result<()> {
         self.driver.disconnect().await
+    }
+
+    /// Set shutdown signal on the underlying driver
+    pub fn set_shutdown_signal(&mut self, shutdown_signal: ShutdownSignal) {
+        self.driver.set_shutdown_signal(shutdown_signal);
     }
 }

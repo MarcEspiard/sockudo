@@ -55,6 +55,8 @@ pub trait RateLimiter: Send + Sync + 'static {
     async fn reset(&self, key: &str) -> Result<()>;
     /// Get the remaining requests for a key without incrementing
     async fn get_remaining(&self, key: &str) -> Result<u32>;
+    /// Disconnect and cleanup resources (Redis connections, etc.)
+    async fn disconnect(&self) -> Result<()>;
 }
 
 // Then modify the middleware module to accept Arc<dyn RateLimiter> directly

@@ -163,4 +163,14 @@ impl RateLimiter for RedisClusterRateLimiter {
         let result = self.check(key).await?;
         Ok(result.remaining)
     }
+
+    async fn disconnect(&self) -> Result<()> {
+        // Note: Redis cluster connection doesn't have an explicit disconnect method
+        // The connection will be dropped when the client goes out of scope
+        // This method is provided for interface compatibility and future cleanup needs
+        tracing::debug!(
+            "RedisClusterRateLimiter disconnect called - connection will be dropped on struct drop"
+        );
+        Ok(())
+    }
 }

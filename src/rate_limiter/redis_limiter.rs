@@ -168,4 +168,14 @@ impl RateLimiter for RedisRateLimiter {
         let result = self.check(key).await?;
         Ok(result.remaining)
     }
+
+    async fn disconnect(&self) -> Result<()> {
+        // Note: Redis MultiplexedConnection doesn't have an explicit disconnect method
+        // The connection will be dropped when the client goes out of scope
+        // This method is provided for interface compatibility and future cleanup needs
+        tracing::debug!(
+            "RedisRateLimiter disconnect called - connection will be dropped on struct drop"
+        );
+        Ok(())
+    }
 }

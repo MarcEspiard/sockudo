@@ -179,6 +179,11 @@ impl RateLimiter for MemoryRateLimiter {
             Ok(self.config.max_requests)
         }
     }
+
+    async fn disconnect(&self) -> Result<()> {
+        // Memory limiter doesn't need any cleanup
+        Ok(())
+    }
 }
 
 impl Drop for MemoryRateLimiter {

@@ -1015,14 +1015,63 @@ impl SockudoServer {
         debug!("Setting running flag to false to signal other tasks to stop");
         self.state.running.store(false, Ordering::SeqCst); // Signal other tasks to stop
 
+        // Wrap the entire shutdown process in a timeout to prevent hanging
+        let shutdown_timeout = Duration::from_secs(30); // Give 30 seconds for complete shutdown
+        let shutdown_result = tokio::time::timeout(shutdown_timeout, self.perform_shutdown()).await;
+
+        match shutdown_result {
+            Ok(result) => {
+                debug!("Shutdown completed within timeout");
+                result
+            }
+            Err(_) => {
+                error!(
+                    "SHUTDOWN TIMEOUT: Server shutdown did not complete within {} seconds",
+                    shutdown_timeout.as_secs()
+                );
+                error!("This indicates a hanging component - forcing shutdown");
+                // Still return Ok to allow main to exit
+                Ok(())
+            }
+        }
+    }
+
+    async fn perform_shutdown(&self) -> Result<()> {
         let mut connections_to_cleanup: Vec<(String, WebSocketRef)> = Vec::new();
 
         // --- Step 1: Collect all connection identifiers ---
         // Scope for the initial lock to quickly gather connection details.
         {
-            debug!("Acquiring connection manager lock for shutdown cleanup");
-            let mut connection_manager_guard = self.state.connection_manager.lock().await;
-            debug!("Connection manager lock acquired");
+            debug!("About to acquire connection manager lock for shutdown cleanup");
+            debug!("Connection manager lock state: attempting lock...");
+
+            // Try with a timeout to detect if we're deadlocked
+            let lock_timeout = Duration::from_secs(10);
+            let lock_result =
+                tokio::time::timeout(lock_timeout, self.state.connection_manager.lock()).await;
+
+            let mut connection_manager_guard = match lock_result {
+                Ok(guard) => {
+                    debug!("Connection manager lock acquired successfully within timeout");
+                    guard
+                }
+                Err(_) => {
+                    error!(
+                        "DEADLOCK DETECTED: Connection manager lock could not be acquired within {} seconds",
+                        lock_timeout.as_secs()
+                    );
+                    error!(
+                        "This suggests another task is holding the connection manager lock and not releasing it"
+                    );
+                    error!(
+                        "Common causes: long-running Redis operations, WebSocket cleanup not completing, or adapter hanging"
+                    );
+                    error!(
+                        "Attempting to continue without proper cleanup - this may leave connections in inconsistent state"
+                    );
+                    return Ok(()); // Exit early to avoid hanging the entire shutdown
+                }
+            };
             match connection_manager_guard.get_namespaces().await {
                 Ok(namespaces_vec) => {
                     // Assuming get_namespaces returns an iterable collection
@@ -1091,16 +1140,18 @@ impl SockudoServer {
 
         // Disconnect from backend services
         debug!("Starting backend services disconnection");
-        
+
         // Check if connection manager adapter needs disconnection
         debug!("Checking if connection manager adapter needs disconnection");
         {
             let connection_manager = self.state.connection_manager.lock().await;
             debug!("Connection manager adapter type: checking for Redis connections");
             // Note: Adapter doesn't have a disconnect method but may hold Redis connections
-            debug!("Note: Connection manager adapter has no disconnect method - potential hang if using Redis adapter");
+            debug!(
+                "Note: Connection manager adapter has no disconnect method - potential hang if using Redis adapter"
+            );
         }
-        
+
         {
             debug!("Acquiring cache manager lock for disconnect");
             let mut cache_manager_locked = self.state.cache_manager.lock().await;
@@ -1112,7 +1163,7 @@ impl SockudoServer {
             }
         }
         debug!("Cache manager lock released");
-        
+
         if let Some(queue_manager_arc) = &self.state.queue_manager {
             debug!("Disconnecting queue manager");
             if let Err(e) = queue_manager_arc.disconnect().await {
@@ -1121,15 +1172,21 @@ impl SockudoServer {
                 debug!("Queue manager disconnected successfully");
             }
         }
-        
+
         // Check if rate limiter needs disconnection (Redis/Redis Cluster backends)
         if let Some(rate_limiter) = &self.state.http_api_rate_limiter {
-            debug!("Checking if HTTP API rate limiter needs disconnection");
-            // Note: Rate limiter doesn't have a disconnect method currently
-            // This might be where Redis connections are hanging
-            debug!("HTTP API rate limiter has no disconnect method - potential hang point if using Redis");
+            debug!("Disconnecting HTTP API rate limiter");
+            debug!("Rate limiter driver: {:?}", self.config.rate_limiter.driver);
+
+            if let Err(e) = rate_limiter.disconnect().await {
+                warn!("Error disconnecting HTTP API rate limiter: {}", e);
+            } else {
+                debug!("HTTP API rate limiter disconnected successfully");
+            }
+        } else {
+            debug!("No HTTP API rate limiter configured");
         }
-        
+
         // Add disconnect for app_manager if it has such a method
         // self.state.app_manager.disconnect().await?;
         debug!("Note: App manager does not have disconnect method");
@@ -1141,7 +1198,7 @@ impl SockudoServer {
         debug!("Starting shutdown grace period sleep");
         tokio::time::sleep(Duration::from_secs(self.config.shutdown_grace_period)).await;
         debug!("Shutdown grace period completed");
-        
+
         info!("Server stopped");
         debug!("Shutdown process completed, returning from stop()");
         Ok(())
@@ -1512,9 +1569,11 @@ async fn main() -> Result<()> {
 
     info!("Sockudo server shutdown complete.");
     debug!("Exiting main function");
-    
+
     // Add a final debug message right before the function returns
-    debug!("About to return from main() - if you don't see 'Process exited', check for hanging tokio runtime or background tasks");
+    debug!(
+        "About to return from main() - if you don't see 'Process exited', check for hanging tokio runtime or background tasks"
+    );
     Ok(())
 }
 

@@ -379,44 +379,56 @@ function getEventNameForChannelType(channelType) {
 export function handleSummary(data) {
   const now = new Date().toISOString();
   
+  // Helper function to safely get metric values
+  const getMetricValue = (metricPath, property, defaultValue = 0) => {
+    try {
+      const metric = metricPath.split('.').reduce((obj, key) => obj?.[key], data.metrics);
+      return metric?.values?.[property] ?? defaultValue;
+    } catch (e) {
+      return defaultValue;
+    }
+  };
+  
+  const authAttempts = getMetricValue('private_channel_auth_total', 'value');
+  const authFailures = getMetricValue('auth_failures_total', 'value');
+  
   const channelMetrics = {
     timestamp: now,
     testConfiguration: {
-      maxVUs: data.metrics.vus.values.max,
-      testDuration: data.state.testRunDurationMs,
+      maxVUs: getMetricValue('vus', 'max'),
+      testDuration: data.state?.testRunDurationMs || 0,
       channelTypes: Object.values(CHANNEL_TYPES),
     },
     subscriptions: {
-      total: data.metrics.channel_subscriptions_total.values.value || 0,
-      unsubscriptions: data.metrics.channel_unsubscriptions_total.values.value || 0,
+      total: getMetricValue('channel_subscriptions_total', 'value'),
+      unsubscriptions: getMetricValue('channel_unsubscriptions_total', 'value'),
       latency: {
-        avg: data.metrics.channel_subscription_latency.values.avg,
-        p95: data.metrics.channel_subscription_latency.values['p(95)'],
-        p99: data.metrics.channel_subscription_latency.values['p(99)'],
+        avg: getMetricValue('channel_subscription_latency', 'avg'),
+        p95: getMetricValue('channel_subscription_latency', 'p(95)'),
+        p99: getMetricValue('channel_subscription_latency', 'p(99)'),
       }
     },
     authentication: {
-      attempts: data.metrics.private_channel_auth_total.values.value || 0,
-      failures: data.metrics.auth_failures_total.values.value || 0,
-      successRate: 1 - ((data.metrics.auth_failures_total.values.value || 0) / 
-                        (data.metrics.private_channel_auth_total.values.value || 1)),
+      attempts: authAttempts,
+      failures: authFailures,
+      successRate: authAttempts > 0 ? 1 - (authFailures / authAttempts) : 0,
     },
     messaging: {
-      totalMessages: data.metrics.messages_by_channel_type.values.value || 0,
+      totalMessages: getMetricValue('messages_by_channel_type', 'value'),
       messageLatency: {
-        avg: data.metrics.channel_message_latency.values.avg,
-        p95: data.metrics.channel_message_latency.values['p(95)'],
-        p99: data.metrics.channel_message_latency.values['p(99)'],
+        avg: getMetricValue('channel_message_latency', 'avg'),
+        p95: getMetricValue('channel_message_latency', 'p(95)'),
+        p99: getMetricValue('channel_message_latency', 'p(99)'),
       }
     },
     presence: {
-      updates: data.metrics.presence_updates_total.values.value || 0,
+      updates: getMetricValue('presence_updates_total', 'value'),
     },
     performance: {
-      iterations: data.metrics.iterations.values.count,
+      iterations: getMetricValue('iterations', 'count'),
       dataTransferred: {
-        sent: data.metrics.data_sent.values.value,
-        received: data.metrics.data_received.values.value,
+        sent: getMetricValue('data_sent', 'value'),
+        received: getMetricValue('data_received', 'value'),
       }
     }
   };

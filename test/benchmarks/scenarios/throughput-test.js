@@ -200,46 +200,56 @@ function startMessageLoop(socket, socketId) {
 export function handleSummary(data) {
   const now = new Date().toISOString();
   
-  const totalMessagesSent = data.metrics.ws_messages_sent_total.values.value || 0;
-  const totalMessagesReceived = data.metrics.ws_messages_received_total.values.value || 0;
-  const testDurationSeconds = data.state.testRunDurationMs / 1000;
+  // Helper function to safely get metric values
+  const getMetricValue = (metricPath, property, defaultValue = 0) => {
+    try {
+      const metric = metricPath.split('.').reduce((obj, key) => obj?.[key], data.metrics);
+      return metric?.values?.[property] ?? defaultValue;
+    } catch (e) {
+      return defaultValue;
+    }
+  };
+  
+  const totalMessagesSent = getMetricValue('ws_messages_sent_total', 'value');
+  const totalMessagesReceived = getMetricValue('ws_messages_received_total', 'value');
+  const testDurationSeconds = (data.state?.testRunDurationMs || 1000) / 1000;
   
   const detailedMetrics = {
     timestamp: now,
     configuration: {
       messageRate: MESSAGE_RATE,
       messageSize: MESSAGE_SIZE,
-      maxVUs: data.metrics.vus.values.max,
+      maxVUs: getMetricValue('vus', 'max'),
     },
     throughput: {
       totalMessagesSent: totalMessagesSent,
       totalMessagesReceived: totalMessagesReceived,
       avgMessagesPerSecond: totalMessagesSent / testDurationSeconds,
-      peakMessagesPerSecond: data.metrics.ws_messages_per_second.values.max,
-      messageDeliveryRate: totalMessagesReceived / totalMessagesSent,
+      peakMessagesPerSecond: getMetricValue('ws_messages_per_second', 'max'),
+      messageDeliveryRate: totalMessagesSent > 0 ? totalMessagesReceived / totalMessagesSent : 0,
     },
     latency: {
       message: {
-        avg: data.metrics.ws_message_latency.values.avg,
-        median: data.metrics.ws_message_latency.values.med,
-        p95: data.metrics.ws_message_latency.values['p(95)'],
-        p99: data.metrics.ws_message_latency.values['p(99)'],
-        max: data.metrics.ws_message_latency.values.max,
+        avg: getMetricValue('ws_message_latency', 'avg'),
+        median: getMetricValue('ws_message_latency', 'med'),
+        p95: getMetricValue('ws_message_latency', 'p(95)'),
+        p99: getMetricValue('ws_message_latency', 'p(99)'),
+        max: getMetricValue('ws_message_latency', 'max'),
       },
       broadcast: {
-        avg: data.metrics.ws_broadcast_latency.values.avg,
-        p95: data.metrics.ws_broadcast_latency.values['p(95)'],
-        p99: data.metrics.ws_broadcast_latency.values['p(99)'],
+        avg: getMetricValue('ws_broadcast_latency', 'avg'),
+        p95: getMetricValue('ws_broadcast_latency', 'p(95)'),
+        p99: getMetricValue('ws_broadcast_latency', 'p(99)'),
       }
     },
     bandwidth: {
-      totalDataSent: data.metrics.data_sent.values.value,
-      totalDataReceived: data.metrics.data_received.values.value,
-      avgMessageSize: data.metrics.ws_message_size_bytes.values.avg,
+      totalDataSent: getMetricValue('data_sent', 'value'),
+      totalDataReceived: getMetricValue('data_received', 'value'),
+      avgMessageSize: getMetricValue('ws_message_size_bytes', 'avg'),
     },
     errors: {
-      messageErrors: data.metrics.ws_message_errors.values.value || 0,
-      errorRate: (data.metrics.ws_message_errors.values.value || 0) / totalMessagesReceived,
+      messageErrors: getMetricValue('ws_message_errors', 'value'),
+      errorRate: totalMessagesReceived > 0 ? getMetricValue('ws_message_errors', 'value') / totalMessagesReceived : 0,
     }
   };
 

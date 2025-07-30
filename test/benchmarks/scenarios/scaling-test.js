@@ -290,54 +290,68 @@ function getCurrentLoadLevel() {
 export function handleSummary(data) {
   const now = new Date().toISOString();
   
+  // Helper function to safely get metric values
+  const getMetricValue = (metricPath, property, defaultValue = 0) => {
+    try {
+      const metric = metricPath.split('.').reduce((obj, key) => obj?.[key], data.metrics);
+      return metric?.values?.[property] ?? defaultValue;
+    } catch (e) {
+      return defaultValue;
+    }
+  };
+
+  const testDurationSeconds = (data.state?.testRunDurationMs || 1000) / 1000;
+  const instanceFailures = getMetricValue('instance_failures', 'value');
+  const healthChecks = getMetricValue('instance_health_checks', 'value');
+  const totalCrossInstanceMessages = getMetricValue('cross_instance_messages_total', 'value');
+  const dataSent = getMetricValue('data_sent', 'value');
+  const dataReceived = getMetricValue('data_received', 'value');
+  
   const scalingMetrics = {
     timestamp: now,
     testConfiguration: {
       instances: INSTANCES.map(i => i.name),
       instanceCount: INSTANCES.length,
-      maxVUs: data.metrics.vus.values.max,
-      testDuration: data.state.testRunDurationMs,
+      maxVUs: getMetricValue('vus', 'max'),
+      testDuration: data.state?.testRunDurationMs || 0,
       channels: TEST_CHANNELS,
     },
     loadDistribution: {
-      totalConnections: data.metrics.instance_connections_total.values.value || 0,
+      totalConnections: getMetricValue('instance_connections_total', 'value'),
       // Note: Instance-specific breakdown would require tag-specific metrics
       distributionBalance: calculateLoadBalance(data),
     },
     crossInstanceCommunication: {
-      totalCrossInstanceMessages: data.metrics.cross_instance_messages_total.values.value || 0,
+      totalCrossInstanceMessages: totalCrossInstanceMessages,
       messageRoutingLatency: {
-        avg: data.metrics.message_routing_latency.values.avg,
-        p50: data.metrics.message_routing_latency.values.med,
-        p95: data.metrics.message_routing_latency.values['p(95)'],
-        p99: data.metrics.message_routing_latency.values['p(99)'],
-        max: data.metrics.message_routing_latency.values.max,
+        avg: getMetricValue('message_routing_latency', 'avg'),
+        p50: getMetricValue('message_routing_latency', 'med'),
+        p95: getMetricValue('message_routing_latency', 'p(95)'),
+        p99: getMetricValue('message_routing_latency', 'p(99)'),
+        max: getMetricValue('message_routing_latency', 'max'),
       },
       clusterSyncLatency: {
-        avg: data.metrics.cluster_sync_latency.values.avg,
-        p95: data.metrics.cluster_sync_latency.values['p(95)'],
-        p99: data.metrics.cluster_sync_latency.values['p(99)'],
+        avg: getMetricValue('cluster_sync_latency', 'avg'),
+        p95: getMetricValue('cluster_sync_latency', 'p(95)'),
+        p99: getMetricValue('cluster_sync_latency', 'p(99)'),
       }
     },
     reliability: {
-      instanceFailures: data.metrics.instance_failures.values.value || 0,
-      healthChecks: data.metrics.instance_health_checks.values.value || 0,
-      failureRate: (data.metrics.instance_failures.values.value || 0) / 
-                   (data.metrics.instance_health_checks.values.value || 1),
+      instanceFailures: instanceFailures,
+      healthChecks: healthChecks,
+      failureRate: healthChecks > 0 ? instanceFailures / healthChecks : 0,
     },
     performance: {
-      iterations: data.metrics.iterations.values.count,
-      iterationDuration: data.metrics.iteration_duration.values.avg,
+      iterations: getMetricValue('iterations', 'count'),
+      iterationDuration: getMetricValue('iteration_duration', 'avg'),
       dataTransferred: {
-        sent: data.metrics.data_sent.values.value,
-        received: data.metrics.data_received.values.value,
-        total: data.metrics.data_sent.values.value + data.metrics.data_received.values.value,
+        sent: dataSent,
+        received: dataReceived,
+        total: dataSent + dataReceived,
       },
       throughput: {
-        messagesPerSecond: (data.metrics.cross_instance_messages_total.values.value || 0) / 
-                          (data.state.testRunDurationMs / 1000),
-        dataPerSecond: (data.metrics.data_sent.values.value + data.metrics.data_received.values.value) / 
-                       (data.state.testRunDurationMs / 1000),
+        messagesPerSecond: testDurationSeconds > 0 ? totalCrossInstanceMessages / testDurationSeconds : 0,
+        dataPerSecond: testDurationSeconds > 0 ? (dataSent + dataReceived) / testDurationSeconds : 0,
       }
     },
     scalingEfficiency: {
@@ -355,8 +369,16 @@ export function handleSummary(data) {
 
 // Helper functions for scaling analysis
 function calculateLoadBalance(data) {
+  const safeGetMetric = (path, prop, defaultVal = 0) => {
+    try {
+      return data.metrics[path]?.values?.[prop] ?? defaultVal;
+    } catch (e) {
+      return defaultVal;
+    }
+  };
+  
   // This is a simplified calculation - in reality you'd need instance-specific metrics
-  const totalConnections = data.metrics.instance_connections_total.values.value || 0;
+  const totalConnections = safeGetMetric('instance_connections_total', 'value');
   const expectedPerInstance = totalConnections / INSTANCES.length;
   
   // Return a balance score (1.0 = perfect balance, 0.0 = completely unbalanced)
@@ -364,8 +386,16 @@ function calculateLoadBalance(data) {
 }
 
 function calculateRoutingEfficiency(data) {
-  const totalMessages = data.metrics.cross_instance_messages_total.values.value || 0;
-  const avgLatency = data.metrics.message_routing_latency.values.avg || 0;
+  const safeGetMetric = (path, prop, defaultVal = 0) => {
+    try {
+      return data.metrics[path]?.values?.[prop] ?? defaultVal;
+    } catch (e) {
+      return defaultVal;
+    }
+  };
+  
+  const totalMessages = safeGetMetric('cross_instance_messages_total', 'value');
+  const avgLatency = safeGetMetric('message_routing_latency', 'avg');
   
   // Lower latency and higher message count = better efficiency
   if (totalMessages === 0 || avgLatency === 0) return 0;
@@ -378,8 +408,16 @@ function calculateRoutingEfficiency(data) {
 }
 
 function calculateLoadBalanceScore(data) {
-  const loadDistribution = data.metrics.load_balance_distribution.values.value || 0;
-  const instanceFailures = data.metrics.instance_failures.values.value || 0;
+  const safeGetMetric = (path, prop, defaultVal = 0) => {
+    try {
+      return data.metrics[path]?.values?.[prop] ?? defaultVal;
+    } catch (e) {
+      return defaultVal;
+    }
+  };
+  
+  const loadDistribution = safeGetMetric('load_balance_distribution', 'value');
+  const instanceFailures = safeGetMetric('instance_failures', 'value');
   
   // Perfect score if good distribution and no failures
   const distributionScore = Math.min(1, loadDistribution / (INSTANCES.length * 50)); // 50 connections per instance as baseline
@@ -389,10 +427,19 @@ function calculateLoadBalanceScore(data) {
 }
 
 function calculateHorizontalScaleScore(data) {
+  const safeGetMetric = (path, prop, defaultVal = 0) => {
+    try {
+      return data.metrics[path]?.values?.[prop] ?? defaultVal;
+    } catch (e) {
+      return defaultVal;
+    }
+  };
+  
   const routingEfficiency = calculateRoutingEfficiency(data);
   const loadBalanceScore = calculateLoadBalanceScore(data);
-  const failureRate = (data.metrics.instance_failures.values.value || 0) / 
-                     (data.metrics.instance_health_checks.values.value || 1);
+  const instanceFailures = safeGetMetric('instance_failures', 'value');
+  const healthChecks = safeGetMetric('instance_health_checks', 'value');
+  const failureRate = healthChecks > 0 ? instanceFailures / healthChecks : 0;
   
   const reliabilityScore = Math.max(0, 1 - failureRate);
   

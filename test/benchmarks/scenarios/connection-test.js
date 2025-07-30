@@ -132,37 +132,47 @@ export default function () {
 export function handleSummary(data) {
   const now = new Date().toISOString();
   
+  // Helper function to safely get metric values
+  const getMetricValue = (metricPath, property, defaultValue = 0) => {
+    try {
+      const metric = metricPath.split('.').reduce((obj, key) => obj?.[key], data.metrics);
+      return metric?.values?.[property] ?? defaultValue;
+    } catch (e) {
+      return defaultValue;
+    }
+  };
+  
   // Save detailed metrics to file
   const detailedMetrics = {
     timestamp: now,
-    duration: data.state.testRunDurationMs,
+    duration: data.state?.testRunDurationMs || 0,
     vus: {
-      max: data.metrics.vus.values.max,
-      min: data.metrics.vus.values.min,
+      max: getMetricValue('vus', 'max'),
+      min: getMetricValue('vus', 'min'),
     },
     connections: {
-      total: data.metrics.ws_connection_success.values.count,
-      successful: data.metrics.ws_connection_success.values.passes,
-      failed: data.metrics.ws_connection_errors.values.value,
-      successRate: data.metrics.ws_connection_success.values.rate,
+      total: getMetricValue('ws_connection_success', 'count'),
+      successful: getMetricValue('ws_connection_success', 'passes'),
+      failed: getMetricValue('ws_connection_errors', 'value'),
+      successRate: getMetricValue('ws_connection_success', 'rate'),
       connectionTime: {
-        avg: data.metrics.ws_connection_time.values.avg,
-        p95: data.metrics.ws_connection_time.values['p(95)'],
-        p99: data.metrics.ws_connection_time.values['p(99)'],
+        avg: getMetricValue('ws_connection_time', 'avg'),
+        p95: getMetricValue('ws_connection_time', 'p(95)'),
+        p99: getMetricValue('ws_connection_time', 'p(99)'),
       }
     },
     messages: {
-      sent: data.metrics.ws_messages_sent.values.value,
-      received: data.metrics.ws_messages_received.values.value,
+      sent: getMetricValue('ws_messages_sent', 'value'),
+      received: getMetricValue('ws_messages_received', 'value'),
       perSecond: {
-        sent: data.metrics.ws_messages_sent.values.rate,
-        received: data.metrics.ws_messages_received.values.rate,
+        sent: getMetricValue('ws_messages_sent', 'rate'),
+        received: getMetricValue('ws_messages_received', 'rate'),
       }
     },
     system: {
-      iterations: data.metrics.iterations.values.count,
-      dataReceived: data.metrics.data_received.values.value,
-      dataSent: data.metrics.data_sent.values.value,
+      iterations: getMetricValue('iterations', 'count'),
+      dataReceived: getMetricValue('data_received', 'value'),
+      dataSent: getMetricValue('data_sent', 'value'),
     }
   };
 

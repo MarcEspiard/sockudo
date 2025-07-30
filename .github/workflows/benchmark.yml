@@ -40,26 +40,18 @@ env:
 
 jobs:
   # Build and prepare for benchmarks
-  prepare:
-    name: Prepare Benchmark Environment
+  build:
+    name: Build Sockudo
     runs-on: ubuntu-latest
     outputs:
       should_run_benchmarks: ${{ steps.check.outputs.should_run }}
       base_branch: ${{ steps.check.outputs.base_branch }}
-      cache_key: ${{ steps.cache_key.outputs.key }}
+      image_tag: ${{ steps.build.outputs.image_tag }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Generate cache key
-        id: cache_key
-        run: |
-          # Create cache key based on Cargo files and Dockerfile
-          CACHE_KEY="sockudo-build-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'Dockerfile') }}"
-          echo "key=$CACHE_KEY" >> $GITHUB_OUTPUT
-          echo "Cache key: $CACHE_KEY"
 
       - name: Check if benchmarks should run
         id: check
@@ -81,12 +73,60 @@ jobs:
             echo "base_branch=master" >> $GITHUB_OUTPUT
           fi
 
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.should_run == 'true'
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=moby/buildkit:buildx-stable-1
+
+      - name: Cache Docker layers
+        if: steps.check.outputs.should_run == 'true'
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'Dockerfile') }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build and cache Sockudo Docker image
+        if: steps.check.outputs.should_run == 'true'
+        id: build
+        run: |
+          # Generate unique image tag
+          IMAGE_TAG="sockudo-benchmark:${{ github.sha }}"
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          
+          # Build Sockudo with cache
+          docker buildx build \
+            --cache-from type=local,src=/tmp/.buildx-cache \
+            --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
+            --tag $IMAGE_TAG \
+            --load \
+            .
+          
+          # Move cache to avoid growing indefinitely
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache || true
+          
+          # Save image as artifact
+          docker save $IMAGE_TAG | gzip > /tmp/sockudo-image.tar.gz
+          
+          echo "Built image: $IMAGE_TAG"
+
+      - name: Upload Docker image artifact
+        if: steps.check.outputs.should_run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sockudo-docker-image
+          path: /tmp/sockudo-image.tar.gz
+          retention-days: 1
+
   # Run performance benchmarks
   benchmark:
     name: Run Performance Tests
     runs-on: ubuntu-latest
-    needs: prepare
-    if: needs.prepare.outputs.should_run_benchmarks == 'true'
+    needs: build
+    if: needs.build.outputs.should_run_benchmarks == 'true'
     
     strategy:
       matrix:
@@ -105,10 +145,16 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
         with:
-          driver-opts: image=moby/buildkit:buildx-stable-1
+          name: sockudo-docker-image
+          path: /tmp/
+
+      - name: Load Docker image
+        run: |
+          docker load < /tmp/sockudo-image.tar.gz
+          echo "Loaded image: ${{ needs.build.outputs.image_tag }}"
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -116,14 +162,6 @@ jobs:
           node-version: '18'
           cache: 'npm'
           cache-dependency-path: 'test/benchmarks/package-lock.json'
-
-      - name: Cache Docker layers
-        uses: actions/cache@v4
-        with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-${{ needs.prepare.outputs.cache_key }}
-          restore-keys: |
-            ${{ runner.os }}-buildx-
 
       - name: Cache k6 installation
         id: cache-k6
@@ -142,16 +180,15 @@ jobs:
           sudo apt-get install k6
 
       - name: Start benchmark environment
+        env:
+          SOCKUDO_IMAGE: ${{ needs.build.outputs.image_tag }}
         run: |
-          # Build with cache
-          docker compose -f docker-compose.benchmark.yml build \
-            --cache-from type=local,src=/tmp/.buildx-cache \
-            --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
-            sockudo metrics-collector
-          
-          # Move cache to avoid growing indefinitely
-          rm -rf /tmp/.buildx-cache
-          mv /tmp/.buildx-cache-new /tmp/.buildx-cache || true
+          # Update docker-compose to use pre-built image
+          sed -i "s|build:.*|image: $SOCKUDO_IMAGE|" docker-compose.benchmark.yml
+          sed -i "/context:/d" docker-compose.benchmark.yml
+          sed -i "/dockerfile:/d" docker-compose.benchmark.yml
+          sed -i "/cache_from:/d" docker-compose.benchmark.yml
+          sed -i "/cache_to:/d" docker-compose.benchmark.yml
           
           # Start Sockudo with Redis backend for testing
           docker compose -f docker-compose.benchmark.yml up -d sockudo redis
@@ -159,7 +196,7 @@ jobs:
           # Wait for services to be healthy
           timeout 60 bash -c 'until docker compose -f docker-compose.benchmark.yml exec sockudo curl -f http://localhost:6001/up/demo-app; do sleep 2; done'
           
-          # Start system metrics collection
+          # Start system metrics collection (build metrics collector if needed)
           docker compose -f docker-compose.benchmark.yml up -d metrics-collector
 
       - name: Install benchmark dependencies
@@ -207,32 +244,59 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          docker compose -f docker-compose.benchmark.yml down -v
-          docker system prune -f
+          # Stop and remove all containers
+          docker compose -f docker-compose.benchmark.yml down -v --remove-orphans
+          
+          # Wait a moment for containers to fully stop
+          sleep 5
+          
+          # Force kill and remove any remaining containers using our ports
+          for port in 6001 6002 6003 6379 9090 9601 9602 9603; do
+            # Find containers using these ports and kill them
+            docker ps -q --filter "publish=$port" | xargs -r docker kill || true
+            docker ps -aq --filter "publish=$port" | xargs -r docker rm -f || true
+            
+            # Also check for containers exposing these ports
+            docker ps -q --filter "expose=$port" | xargs -r docker kill || true
+            docker ps -aq --filter "expose=$port" | xargs -r docker rm -f || true
+          done
+          
+          # Kill any sockudo containers by name pattern
+          docker ps -q --filter "name=sockudo" | xargs -r docker kill || true
+          docker ps -aq --filter "name=sockudo" | xargs -r docker rm -f || true
+          
+          docker ps -q --filter "name=redis" | xargs -r docker kill || true
+          docker ps -aq --filter "name=redis" | xargs -r docker rm -f || true
+          
+          # Clean up networks and volumes
+          docker network prune -f || true
+          docker volume prune -f || true
+          
+          # Final check - list any remaining containers
+          echo "Remaining containers:"
+          docker ps -a || true
 
   # Scaling test (separate job due to different requirements)
   scaling-benchmark:
     name: Run Scaling Tests
     runs-on: ubuntu-latest
-    needs: prepare
-    if: needs.prepare.outputs.should_run_benchmarks == 'true' && (github.event.inputs.test_scenario == 'scaling' || github.event.inputs.test_scenario == 'all' || github.event_name != 'workflow_dispatch')
+    needs: build
+    if: needs.build.outputs.should_run_benchmarks == 'true' && (github.event.inputs.test_scenario == 'scaling' || github.event.inputs.test_scenario == 'all' || github.event_name != 'workflow_dispatch')
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
         with:
-          driver-opts: image=moby/buildkit:buildx-stable-1
+          name: sockudo-docker-image
+          path: /tmp/
 
-      - name: Cache Docker layers
-        uses: actions/cache@v4
-        with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-${{ needs.prepare.outputs.cache_key }}
-          restore-keys: |
-            ${{ runner.os }}-buildx-
+      - name: Load Docker image
+        run: |
+          docker load < /tmp/sockudo-image.tar.gz
+          echo "Loaded image: ${{ needs.build.outputs.image_tag }}"
 
       - name: Cache k6 installation
         id: cache-k6
@@ -251,16 +315,15 @@ jobs:
           sudo apt-get install k6
 
       - name: Start scaling test environment
+        env:
+          SOCKUDO_IMAGE: ${{ needs.build.outputs.image_tag }}
         run: |
-          # Build with cache
-          docker compose -f docker-compose.benchmark.yml build \
-            --cache-from type=local,src=/tmp/.buildx-cache \
-            --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
-            sockudo
-          
-          # Move cache to avoid growing indefinitely
-          rm -rf /tmp/.buildx-cache
-          mv /tmp/.buildx-cache-new /tmp/.buildx-cache || true
+          # Update docker-compose to use pre-built image for all Sockudo instances
+          sed -i "s|build:.*|image: $SOCKUDO_IMAGE|g" docker-compose.benchmark.yml
+          sed -i "/context:/d" docker-compose.benchmark.yml
+          sed -i "/dockerfile:/d" docker-compose.benchmark.yml
+          sed -i "/cache_from:/d" docker-compose.benchmark.yml
+          sed -i "/cache_to:/d" docker-compose.benchmark.yml
           
           # Start multiple Sockudo instances with Redis cluster
           docker compose -f docker-compose.benchmark.yml --profile scaling up -d
@@ -300,14 +363,26 @@ jobs:
       - name: Cleanup scaling environment
         if: always()
         run: |
-          docker compose -f docker-compose.benchmark.yml --profile scaling down -v
+          docker compose -f docker-compose.benchmark.yml --profile scaling down -v --remove-orphans
+          
+          # Wait for containers to stop
+          sleep 5
+          
+          # Force cleanup any remaining containers
+          for port in 6001 6002 6003 6379 9090 9601 9602 9603; do
+            docker ps -q --filter "publish=$port" | xargs -r docker kill || true
+            docker ps -aq --filter "publish=$port" | xargs -r docker rm -f || true
+            docker ps -q --filter "expose=$port" | xargs -r docker kill || true
+            docker ps -aq --filter "expose=$port" | xargs -r docker rm -f || true
+          done
+          
           docker system prune -f
 
   # Analyze results and detect performance regressions
   analyze:
     name: Analyze Performance Results
     runs-on: ubuntu-latest
-    needs: [benchmark, scaling-benchmark]
+    needs: [build, benchmark, scaling-benchmark]
     if: always() && (needs.benchmark.result == 'success' || needs.scaling-benchmark.result == 'success')
     
     steps:
@@ -345,7 +420,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REGRESSION_THRESHOLD: ${{ github.event.inputs.performance_threshold || '10' }}
-          BASE_BRANCH: ${{ needs.prepare.outputs.base_branch }}
+          BASE_BRANCH: ${{ needs.build.outputs.base_branch }}
         run: |
           # This would compare with baseline metrics from the base branch
           # For now, we'll just check if critical thresholds are met

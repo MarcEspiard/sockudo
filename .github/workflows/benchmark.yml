@@ -1,5 +1,14 @@
 name: Performance Benchmarks
 
+# This workflow requires manual approval from maintainers to run.
+# To set this up:
+# 1. Go to Settings > Environments in your GitHub repository
+# 2. Create a new environment called "benchmark-approval"
+# 3. Add protection rules:
+#    - Required reviewers: Add maintainers who can approve benchmark runs
+#    - You can also add deployment branches rules if needed
+# This prevents automated benchmark runs on every PR and saves resources.
+
 on:
   pull_request:
     branches: [master, main]
@@ -43,6 +52,7 @@ jobs:
   build:
     name: Build Sockudo
     runs-on: ubuntu-latest
+    environment: benchmark-approval
     outputs:
       should_run_benchmarks: ${{ steps.check.outputs.should_run }}
       base_branch: ${{ steps.check.outputs.base_branch }}
@@ -56,15 +66,9 @@ jobs:
       - name: Check if benchmarks should run
         id: check
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "should_run=true" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event_name }}" = "push" ]; then
-            echo "should_run=true" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "should_run=true" >> $GITHUB_OUTPUT
-          else
-            echo "should_run=false" >> $GITHUB_OUTPUT
-          fi
+          # Always require manual approval through the environment protection
+          # Workflow will pause here until approved by maintainers
+          echo "should_run=true" >> $GITHUB_OUTPUT
           
           # Determine base branch for comparison
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -376,7 +380,7 @@ jobs:
 
       - name: Run scaling benchmark
         working-directory: test/benchmarks
-        timeout-minutes: 15
+        timeout-minutes: 6
         env:
           SOCKUDO_URL_1: ws://localhost:6001
           SOCKUDO_URL_2: ws://localhost:6002
@@ -384,8 +388,9 @@ jobs:
           APP_KEY: demo-app
         run: |
           npm ci
-          # Create results directory if it doesn't exist
+          # Create results directory with proper permissions
           mkdir -p results
+          chmod 755 results
           k6 run scenarios/scaling-test.js --out json=results/scaling-raw.json
 
       - name: Upload scaling results

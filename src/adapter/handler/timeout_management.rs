@@ -65,10 +65,10 @@ impl ConnectionHandler {
                         "Sent ping to socket {} due to activity timeout",
                         socket_id_clone
                     );
-                    
+
                     // Release locks before waiting for pong
                     drop(conn_manager);
-                    
+
                     // Wait for pong response
                     sleep(Duration::from_secs(30)).await;
 
@@ -101,7 +101,7 @@ impl ConnectionHandler {
                         "Failed to send ping to socket {} (connection likely closed by client): {}",
                         socket_id_clone, e
                     );
-                    
+
                     // Clean up the connection since it's broken
                     // Note: cleanup_connection expects the connection to still exist
                     conn_manager.cleanup_connection(&app_id_clone, conn).await;

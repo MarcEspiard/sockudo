@@ -194,11 +194,19 @@ jobs:
           SOCKUDO_IMAGE: ${{ needs.build.outputs.image_tag }}
         run: |
           # Update docker-compose to use pre-built image
-          sed -i "s|build:.*|image: $SOCKUDO_IMAGE|" docker-compose.benchmark.yml
-          sed -i "/context:/d" docker-compose.benchmark.yml
-          sed -i "/dockerfile:/d" docker-compose.benchmark.yml
-          sed -i "/cache_from:/d" docker-compose.benchmark.yml
-          sed -i "/cache_to:/d" docker-compose.benchmark.yml
+          # Create a temporary file with the build section replaced
+          awk -v img="$SOCKUDO_IMAGE" '
+            /^  sockudo:/ { in_sockudo=1 }
+            /^  [^ ]/ && in_sockudo && !/^  sockudo:/ { in_sockudo=0 }
+            /^    build:/ && in_sockudo { 
+              print "    image: " img
+              in_build=1
+              next
+            }
+            /^    [^ ]/ && in_build { in_build=0 }
+            !in_build { print }
+          ' docker-compose.benchmark.yml > docker-compose.benchmark.yml.tmp
+          mv docker-compose.benchmark.yml.tmp docker-compose.benchmark.yml
           
           # Start Sockudo with Redis backend for testing
           docker compose -f docker-compose.benchmark.yml up -d sockudo redis
@@ -329,11 +337,19 @@ jobs:
           SOCKUDO_IMAGE: ${{ needs.build.outputs.image_tag }}
         run: |
           # Update docker-compose to use pre-built image for all Sockudo instances
-          sed -i "s|build:.*|image: $SOCKUDO_IMAGE|g" docker-compose.benchmark.yml
-          sed -i "/context:/d" docker-compose.benchmark.yml
-          sed -i "/dockerfile:/d" docker-compose.benchmark.yml
-          sed -i "/cache_from:/d" docker-compose.benchmark.yml
-          sed -i "/cache_to:/d" docker-compose.benchmark.yml
+          # Replace all build sections with image references
+          awk -v img="$SOCKUDO_IMAGE" '
+            /^  sockudo.*:/ { in_sockudo=1 }
+            /^  [^ ]/ && in_sockudo && !/^  sockudo.*:/ { in_sockudo=0 }
+            /^    build:/ && in_sockudo { 
+              print "    image: " img
+              in_build=1
+              next
+            }
+            /^    [^ ]/ && in_build { in_build=0 }
+            !in_build { print }
+          ' docker-compose.benchmark.yml > docker-compose.benchmark.yml.tmp
+          mv docker-compose.benchmark.yml.tmp docker-compose.benchmark.yml
           
           # Start multiple Sockudo instances with Redis cluster
           docker compose -f docker-compose.benchmark.yml --profile scaling up -d

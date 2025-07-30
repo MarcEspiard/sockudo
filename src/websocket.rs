@@ -12,6 +12,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::error::Error as StdError;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::Arc;
@@ -214,15 +215,48 @@ pub struct MessageSender {
     _receiver_handle: JoinHandle<()>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SocketOperation {
+    WriteFrame,
+    SendCloseFrame,
+}
+
+impl std::fmt::Display for SocketOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SocketOperation::WriteFrame => write!(f, "write frame to WebSocket"),
+            SocketOperation::SendCloseFrame => write!(f, "send close frame"),
+        }
+    }
+}
+
+impl SocketOperation {
+    fn is_close_operation(&self) -> bool {
+        matches!(self, SocketOperation::SendCloseFrame)
+    }
+}
+
 impl MessageSender {
-    fn is_connection_error<E: std::fmt::Display>(error: &E) -> bool {
-        let error_str = error.to_string();
-        error_str.contains("Broken pipe") || 
-        error_str.contains("Connection reset") || 
-        error_str.contains("os error 32")
+    fn is_connection_error(error: &fastwebsockets::WebSocketError) -> bool {
+        // For now, let's use a different approach to check if it's an IO error
+        // We'll pattern match on the error's source or check if it contains IO error
+        if let Some(source) = StdError::source(error) {
+            if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
+                matches!(
+                    io_err.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                )
+            } else {
+                false
+            }
+        } else {
+            false
+        }
     }
 
-    fn log_connection_error<E: std::fmt::Display>(error: &E, operation: &str, frame_count: usize, is_shutting_down: bool) {
+    fn log_connection_error(error: &fastwebsockets::WebSocketError, operation: SocketOperation, frame_count: usize, is_shutting_down: bool) {
         let is_conn_err = Self::is_connection_error(error);
         
         if is_conn_err && is_shutting_down {
@@ -232,7 +266,7 @@ impl MessageSender {
         } else if is_conn_err {
             warn!("Connection {} failed during operation (after {} frames): {}", operation, frame_count, error);
         } else {
-            if operation.contains("close") {
+            if operation.is_close_operation() {
                 warn!("Failed to {}: {}", operation, error);
             } else {
                 error!("Failed to {}: {}", operation, error);
@@ -256,7 +290,7 @@ impl MessageSender {
                 }
                 
                 if let Err(e) = socket.write_frame(frame).await {
-                    Self::log_connection_error(&e, "write frame to WebSocket", frame_count, is_shutting_down);
+                    Self::log_connection_error(&e, SocketOperation::WriteFrame, frame_count, is_shutting_down);
                     break;
                 }
             }
@@ -266,7 +300,7 @@ impl MessageSender {
                 .write_frame(Frame::close(1000, b"Normal closure"))
                 .await
             {
-                Self::log_connection_error(&e, "send close frame", frame_count, false);
+                Self::log_connection_error(&e, SocketOperation::SendCloseFrame, frame_count, true);
             }
         });
 

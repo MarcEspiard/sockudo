@@ -94,7 +94,6 @@ jobs:
         run: |
           # Generate unique image tag
           IMAGE_TAG="sockudo-benchmark:${{ github.sha }}"
-          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
           
           # Build Sockudo with cache
           docker buildx build \
@@ -112,6 +111,9 @@ jobs:
           docker save $IMAGE_TAG | gzip > /tmp/sockudo-image.tar.gz
           
           echo "Built image: $IMAGE_TAG"
+          
+          # Output the clean image tag (must be last to avoid capturing other output)
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
 
       - name: Upload Docker image artifact
         if: steps.check.outputs.should_run == 'true'

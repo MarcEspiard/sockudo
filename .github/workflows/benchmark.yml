@@ -230,6 +230,8 @@ jobs:
           APP_SECRET: demo-secret
         run: |
           echo "Running ${{ matrix.test_scenario.name }} benchmark..."
+          # Create results directory if it doesn't exist
+          mkdir -p results
           k6 run scenarios/${{ matrix.test_scenario.script }} \
             --out json=results/${{ matrix.test_scenario.name }}-raw.json
 
@@ -376,6 +378,8 @@ jobs:
           APP_KEY: demo-app
         run: |
           npm ci
+          # Create results directory if it doesn't exist
+          mkdir -p results
           k6 run scenarios/scaling-test.js --out json=results/scaling-raw.json
 
       - name: Upload scaling results

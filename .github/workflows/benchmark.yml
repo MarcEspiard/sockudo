@@ -234,14 +234,10 @@ jobs:
           APP_SECRET: demo-secret
         run: |
           echo "Running ${{ matrix.test_scenario.name }} benchmark..."
-          # Create results directory with proper permissions
-          mkdir -p results
-          chmod 755 results
+          # Create results directory if it doesn't exist
+          mkdir -p results || true
           
-          # Debug: Show current directory and permissions
-          pwd
-          ls -la
-          
+          # Run k6 test
           k6 run scenarios/${{ matrix.test_scenario.script }} \
             --out json=results/${{ matrix.test_scenario.name }}-raw.json
 
@@ -382,15 +378,22 @@ jobs:
         working-directory: test/benchmarks
         timeout-minutes: 6
         env:
+          SOCKUDO_URL: ws://localhost:6001
           SOCKUDO_URL_1: ws://localhost:6001
           SOCKUDO_URL_2: ws://localhost:6002
           SOCKUDO_URL_3: ws://localhost:6003
           APP_KEY: demo-app
         run: |
           npm ci
-          # Create results directory with proper permissions
-          mkdir -p results
-          chmod 755 results
+          # Create results directory if it doesn't exist
+          mkdir -p results || true
+          
+          # Check which instances are actually running
+          echo "Checking for running Sockudo instances..."
+          curl -s http://localhost:6001/up/demo-app && echo "Instance 1: ✓" || echo "Instance 1: ✗"
+          curl -s http://localhost:6002/up/demo-app && echo "Instance 2: ✓" || echo "Instance 2: ✗"
+          curl -s http://localhost:6003/up/demo-app && echo "Instance 3: ✓" || echo "Instance 3: ✗"
+          
           k6 run scenarios/scaling-test.js --out json=results/scaling-raw.json
 
       - name: Upload scaling results

@@ -8,7 +8,7 @@
     "test:channels": "k6 run scenarios/channel-test.js",
     "test:scaling": "k6 run scenarios/scaling-test.js",
     "test:all": "npm run test:connections && npm run test:throughput && npm run test:channels",
-    "test:docker": "docker-compose -f ../../docker-compose.benchmark.yml --profile test run k6",
+    "test:docker": "docker compose -f ../../docker-compose.benchmark.yml --profile test run k6",
     "metrics:start": "node metrics/system-metrics.js",
     "report": "node metrics/generate-report.js",
     "setup": "echo 'Setting up load testing environment...' && npm install"

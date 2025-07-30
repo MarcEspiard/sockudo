@@ -157,7 +157,7 @@ cleanup() {
     if [ "$USE_DOCKER" = true ]; then
         log "Cleaning up Docker containers..."
         cd "$PROJECT_ROOT"
-        docker-compose -f docker-compose.benchmark.yml down --remove-orphans 2>/dev/null || true
+        docker compose -f docker-compose.benchmark.yml down --remove-orphans 2>/dev/null || true
     fi
 }
 
@@ -169,13 +169,13 @@ if [ "$USE_DOCKER" = true ]; then
     cd "$PROJECT_ROOT"
     
     # Start base services
-    docker-compose -f docker-compose.benchmark.yml up -d sockudo redis
+    docker compose -f docker-compose.benchmark.yml up -d sockudo redis
     
     # Wait for Sockudo to be ready
     log "Waiting for Sockudo to be ready..."
     timeout 60 bash -c 'until curl -f http://localhost:6001/up/demo-app &>/dev/null; do sleep 2; done' || {
         log_error "Sockudo failed to start within 60 seconds"
-        docker-compose -f docker-compose.benchmark.yml logs sockudo
+        docker compose -f docker-compose.benchmark.yml logs sockudo
         exit 1
     }
     
@@ -184,7 +184,7 @@ if [ "$USE_DOCKER" = true ]; then
     # For scaling tests, start additional instances
     if [ "$TEST_TYPE" = "scaling" ] || [ "$TEST_TYPE" = "all" ]; then
         log "Starting additional instances for scaling test..."
-        docker-compose -f docker-compose.benchmark.yml --profile scaling up -d
+        docker compose -f docker-compose.benchmark.yml --profile scaling up -d
         
         # Wait for all instances
         for port in 6002 6003; do
@@ -263,7 +263,7 @@ case $TEST_TYPE in
         if [ "$USE_DOCKER" = true ]; then
             # Start scaling profile if not already running
             cd "$PROJECT_ROOT"
-            docker-compose -f docker-compose.benchmark.yml --profile scaling up -d
+            docker compose -f docker-compose.benchmark.yml --profile scaling up -d
             cd "$SCRIPT_DIR"
             
             export SOCKUDO_URL_1="$SOCKUDO_URL"

@@ -115,13 +115,13 @@ jobs:
       - name: Start benchmark environment
         run: |
           # Start Sockudo with Redis backend for testing
-          docker-compose -f docker-compose.benchmark.yml up -d sockudo redis
+          docker compose -f docker-compose.benchmark.yml up -d sockudo redis
           
           # Wait for services to be healthy
-          timeout 60 bash -c 'until docker-compose -f docker-compose.benchmark.yml exec sockudo curl -f http://localhost:6001/up/demo-app; do sleep 2; done'
+          timeout 60 bash -c 'until docker compose -f docker-compose.benchmark.yml exec sockudo curl -f http://localhost:6001/up/demo-app; do sleep 2; done'
           
           # Start system metrics collection
-          docker-compose -f docker-compose.benchmark.yml up -d metrics-collector
+          docker compose -f docker-compose.benchmark.yml up -d metrics-collector
 
       - name: Install benchmark dependencies
         working-directory: test/benchmarks
@@ -143,19 +143,19 @@ jobs:
         if: always()
         run: |
           # Stop metrics collector and save results
-          docker-compose -f docker-compose.benchmark.yml stop metrics-collector
+          docker compose -f docker-compose.benchmark.yml stop metrics-collector
           
           # Copy metrics from container
-          docker-compose -f docker-compose.benchmark.yml cp metrics-collector:/app/results/. test/benchmarks/results/ || true
+          docker compose -f docker-compose.benchmark.yml cp metrics-collector:/app/results/. test/benchmarks/results/ || true
 
       - name: Collect system logs
         if: always()
         run: |
           echo "=== Sockudo Logs ===" >> test/benchmarks/results/system-logs.txt
-          docker-compose -f docker-compose.benchmark.yml logs sockudo >> test/benchmarks/results/system-logs.txt || true
+          docker compose -f docker-compose.benchmark.yml logs sockudo >> test/benchmarks/results/system-logs.txt || true
           
           echo "=== Redis Logs ===" >> test/benchmarks/results/system-logs.txt
-          docker-compose -f docker-compose.benchmark.yml logs redis >> test/benchmarks/results/system-logs.txt || true
+          docker compose -f docker-compose.benchmark.yml logs redis >> test/benchmarks/results/system-logs.txt || true
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
@@ -168,7 +168,7 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          docker-compose -f docker-compose.benchmark.yml down -v
+          docker compose -f docker-compose.benchmark.yml down -v
           docker system prune -f
 
   # Scaling test (separate job due to different requirements)
@@ -196,7 +196,7 @@ jobs:
       - name: Start scaling test environment
         run: |
           # Start multiple Sockudo instances with Redis cluster
-          docker-compose -f docker-compose.benchmark.yml --profile scaling up -d
+          docker compose -f docker-compose.benchmark.yml --profile scaling up -d
           
           # Wait for all instances to be healthy
           for port in 6001 6002 6003; do
@@ -226,7 +226,7 @@ jobs:
       - name: Cleanup scaling environment
         if: always()
         run: |
-          docker-compose -f docker-compose.benchmark.yml --profile scaling down -v
+          docker compose -f docker-compose.benchmark.yml --profile scaling down -v
           docker system prune -f
 
   # Analyze results and detect performance regressions

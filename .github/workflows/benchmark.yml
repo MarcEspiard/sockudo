@@ -223,7 +223,23 @@ jobs:
 
       - name: Install benchmark dependencies
         working-directory: test/benchmarks
-        run: npm ci
+        run: |
+          npm ci
+          # Create results directory with proper ownership
+          rm -rf results || true
+          mkdir -p results
+          # Make sure we can write to it
+          touch results/test.txt && rm results/test.txt
+
+      - name: Verify Sockudo is running
+        run: |
+          echo "Checking if Sockudo is responding..."
+          curl -f http://localhost:6001/up/demo-app || {
+            echo "Sockudo health check failed!"
+            docker compose -f docker-compose.benchmark.yml ps
+            docker compose -f docker-compose.benchmark.yml logs sockudo || true
+            exit 1
+          }
 
       - name: Run ${{ matrix.test_scenario.name }} benchmark
         working-directory: test/benchmarks
@@ -234,8 +250,6 @@ jobs:
           APP_SECRET: demo-secret
         run: |
           echo "Running ${{ matrix.test_scenario.name }} benchmark..."
-          # Create results directory if it doesn't exist
-          mkdir -p results || true
           
           # Run k6 test
           k6 run scenarios/${{ matrix.test_scenario.script }} \

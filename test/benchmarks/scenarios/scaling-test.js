@@ -363,7 +363,7 @@ export function handleSummary(data) {
 
   return {
     'stdout': textSummary(data, { indent: ' ', enableColors: true }),
-    '../results/scaling-test-results.json': JSON.stringify(scalingMetrics, null, 2),
+    './results/scaling-test-results.json': JSON.stringify(scalingMetrics, null, 2),
   };
 }
 

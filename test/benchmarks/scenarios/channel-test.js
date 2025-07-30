@@ -442,6 +442,6 @@ export function handleSummary(data) {
 
   return {
     'stdout': textSummary(data, { indent: ' ', enableColors: true }),
-    '../results/channel-test-results.json': JSON.stringify(channelMetrics, null, 2),
+    './results/channel-test-results.json': JSON.stringify(channelMetrics, null, 2),
   };
 }

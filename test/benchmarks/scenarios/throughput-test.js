@@ -255,6 +255,6 @@ export function handleSummary(data) {
 
   return {
     'stdout': textSummary(data, { indent: ' ', enableColors: true }),
-    '../results/throughput-test-results.json': JSON.stringify(detailedMetrics, null, 2),
+    './results/throughput-test-results.json': JSON.stringify(detailedMetrics, null, 2),
   };
 }

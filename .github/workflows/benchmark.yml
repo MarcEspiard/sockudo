@@ -230,8 +230,14 @@ jobs:
           APP_SECRET: demo-secret
         run: |
           echo "Running ${{ matrix.test_scenario.name }} benchmark..."
-          # Create results directory if it doesn't exist
+          # Create results directory with proper permissions
           mkdir -p results
+          chmod 755 results
+          
+          # Debug: Show current directory and permissions
+          pwd
+          ls -la
+          
           k6 run scenarios/${{ matrix.test_scenario.script }} \
             --out json=results/${{ matrix.test_scenario.name }}-raw.json
 

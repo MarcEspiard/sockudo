@@ -1,0 +1,347 @@
+name: Performance Benchmarks
+
+on:
+  pull_request:
+    branches: [master, main]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'docker-compose.benchmark.yml'
+      - 'test/benchmarks/**'
+  push:
+    branches: [master, main]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+    inputs:
+      test_scenario:
+        description: 'Test scenario to run'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - 'all'
+          - 'connections'
+          - 'throughput'
+          - 'channels'
+          - 'scaling'
+      performance_threshold:
+        description: 'Performance regression threshold (%)'
+        required: false
+        default: '10'
+        type: string
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build and prepare for benchmarks
+  prepare:
+    name: Prepare Benchmark Environment
+    runs-on: ubuntu-latest
+    outputs:
+      should_run_benchmarks: ${{ steps.check.outputs.should_run }}
+      base_branch: ${{ steps.check.outputs.base_branch }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if benchmarks should run
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_run=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Determine base branch for comparison
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "base_branch=${{ github.base_ref }}" >> $GITHUB_OUTPUT
+          else
+            echo "base_branch=master" >> $GITHUB_OUTPUT
+          fi
+
+  # Run performance benchmarks
+  benchmark:
+    name: Run Performance Tests
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.should_run_benchmarks == 'true'
+    
+    strategy:
+      matrix:
+        test_scenario:
+          - name: "connections"
+            script: "connection-test.js"
+            timeout: 15
+          - name: "throughput"
+            script: "throughput-test.js"  
+            timeout: 10
+          - name: "channels"
+            script: "channel-test.js"
+            timeout: 12
+        
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install k6
+
+      - name: Start benchmark environment
+        run: |
+          # Start Sockudo with Redis backend for testing
+          docker-compose -f docker-compose.benchmark.yml up -d sockudo redis
+          
+          # Wait for services to be healthy
+          timeout 60 bash -c 'until docker-compose -f docker-compose.benchmark.yml exec sockudo curl -f http://localhost:6001/up/demo-app; do sleep 2; done'
+          
+          # Start system metrics collection
+          docker-compose -f docker-compose.benchmark.yml up -d metrics-collector
+
+      - name: Install benchmark dependencies
+        working-directory: test/benchmarks
+        run: npm install
+
+      - name: Run ${{ matrix.test_scenario.name }} benchmark
+        working-directory: test/benchmarks
+        timeout-minutes: ${{ matrix.test_scenario.timeout }}
+        env:
+          SOCKUDO_URL: ws://localhost:6001
+          APP_KEY: demo-app
+          APP_SECRET: demo-secret
+        run: |
+          echo "Running ${{ matrix.test_scenario.name }} benchmark..."
+          k6 run scenarios/${{ matrix.test_scenario.script }} \
+            --out json=results/${{ matrix.test_scenario.name }}-raw.json
+
+      - name: Stop metrics collection
+        if: always()
+        run: |
+          # Stop metrics collector and save results
+          docker-compose -f docker-compose.benchmark.yml stop metrics-collector
+          
+          # Copy metrics from container
+          docker-compose -f docker-compose.benchmark.yml cp metrics-collector:/app/results/. test/benchmarks/results/ || true
+
+      - name: Collect system logs
+        if: always()
+        run: |
+          echo "=== Sockudo Logs ===" >> test/benchmarks/results/system-logs.txt
+          docker-compose -f docker-compose.benchmark.yml logs sockudo >> test/benchmarks/results/system-logs.txt || true
+          
+          echo "=== Redis Logs ===" >> test/benchmarks/results/system-logs.txt
+          docker-compose -f docker-compose.benchmark.yml logs redis >> test/benchmarks/results/system-logs.txt || true
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results-${{ matrix.test_scenario.name }}
+          path: test/benchmarks/results/
+          retention-days: 30
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker-compose -f docker-compose.benchmark.yml down -v
+          docker system prune -f
+
+  # Scaling test (separate job due to different requirements)
+  scaling-benchmark:
+    name: Run Scaling Tests
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.should_run_benchmarks == 'true' && (github.event.inputs.test_scenario == 'scaling' || github.event.inputs.test_scenario == 'all' || github.event_name != 'workflow_dispatch')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install k6
+
+      - name: Start scaling test environment
+        run: |
+          # Start multiple Sockudo instances with Redis cluster
+          docker-compose -f docker-compose.benchmark.yml --profile scaling up -d
+          
+          # Wait for all instances to be healthy
+          for port in 6001 6002 6003; do
+            timeout 60 bash -c "until curl -f http://localhost:$port/up/demo-app; do sleep 2; done"
+          done
+
+      - name: Run scaling benchmark
+        working-directory: test/benchmarks
+        timeout-minutes: 15
+        env:
+          SOCKUDO_URL_1: ws://localhost:6001
+          SOCKUDO_URL_2: ws://localhost:6002
+          SOCKUDO_URL_3: ws://localhost:6003
+          APP_KEY: demo-app
+        run: |
+          npm install
+          k6 run scenarios/scaling-test.js --out json=results/scaling-raw.json
+
+      - name: Upload scaling results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results-scaling
+          path: test/benchmarks/results/
+          retention-days: 30
+
+      - name: Cleanup scaling environment
+        if: always()
+        run: |
+          docker-compose -f docker-compose.benchmark.yml --profile scaling down -v
+          docker system prune -f
+
+  # Analyze results and detect performance regressions
+  analyze:
+    name: Analyze Performance Results
+    runs-on: ubuntu-latest
+    needs: [benchmark, scaling-benchmark]
+    if: always() && (needs.benchmark.result == 'success' || needs.scaling-benchmark.result == 'success')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Download all benchmark results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: benchmark-results-*
+          path: benchmark-artifacts/
+          merge-multiple: true
+
+      - name: Install analysis dependencies
+        working-directory: test/benchmarks
+        run: npm install
+
+      - name: Generate performance report
+        working-directory: test/benchmarks
+        run: |
+          node metrics/generate-report.js ../../benchmark-artifacts/ > performance-report.md
+
+      - name: Check for performance regressions
+        id: regression_check
+        working-directory: test/benchmarks
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGRESSION_THRESHOLD: ${{ github.event.inputs.performance_threshold || '10' }}
+          BASE_BRANCH: ${{ needs.prepare.outputs.base_branch }}
+        run: |
+          # This would compare with baseline metrics from the base branch
+          # For now, we'll just check if critical thresholds are met
+          
+          EXIT_CODE=0
+          
+          # Check connection test results
+          if [ -f "../../benchmark-artifacts/connection-test-results.json" ]; then
+            SUCCESS_RATE=$(jq -r '.connections.successRate' ../../benchmark-artifacts/connection-test-results.json 2>/dev/null || echo "0")
+            if (( $(echo "$SUCCESS_RATE < 0.95" | bc -l) )); then
+              echo "⚠️ Connection success rate below threshold: $SUCCESS_RATE < 0.95"
+              EXIT_CODE=1
+            fi
+          fi
+          
+          # Check throughput test results  
+          if [ -f "../../benchmark-artifacts/throughput-test-results.json" ]; then
+            MSG_PER_SEC=$(jq -r '.throughput.avgMessagesPerSecond' ../../benchmark-artifacts/throughput-test-results.json 2>/dev/null || echo "0")
+            if (( $(echo "$MSG_PER_SEC < 1000" | bc -l) )); then
+              echo "⚠️ Message throughput below threshold: $MSG_PER_SEC < 1000 msg/sec"
+              EXIT_CODE=1
+            fi
+          fi
+          
+          echo "regression_detected=$EXIT_CODE" >> $GITHUB_OUTPUT
+          exit $EXIT_CODE
+
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let comment = '## 🚀 Performance Benchmark Results\n\n';
+            
+            try {
+              const report = fs.readFileSync('test/benchmarks/performance-report.md', 'utf8');
+              comment += report;
+            } catch (error) {
+              comment += '❌ Could not generate performance report\n';
+            }
+            
+            // Add artifacts info
+            comment += '\n### 📊 Detailed Results\n';
+            comment += 'Detailed benchmark results are available as workflow artifacts.\n';
+            
+            // Add regression warning if detected
+            if ('${{ steps.regression_check.outputs.regression_detected }}' === '1') {
+              comment = '⚠️ **Performance Regression Detected** ⚠️\n\n' + comment;
+            }
+            
+            comment += '\n---\n*Automated performance testing powered by k6 and GitHub Actions*';
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Upload performance report
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-report
+          path: |
+            test/benchmarks/performance-report.md
+            benchmark-artifacts/
+          retention-days: 90
+
+      - name: Fail if regression detected
+        if: steps.regression_check.outputs.regression_detected == '1'
+        run: |
+          echo "Performance regression detected! Check the results above."
+          exit 1

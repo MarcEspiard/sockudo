@@ -1,0 +1,26 @@
+{
+  "name": "sockudo-load-tests",
+  "version": "1.0.0",
+  "description": "Load testing suite for Sockudo WebSocket server",
+  "scripts": {
+    "test:connections": "k6 run scenarios/connection-test.js",
+    "test:throughput": "k6 run scenarios/throughput-test.js",
+    "test:channels": "k6 run scenarios/channel-test.js",
+    "test:scaling": "k6 run scenarios/scaling-test.js",
+    "test:all": "npm run test:connections && npm run test:throughput && npm run test:channels",
+    "test:docker": "docker-compose -f ../../docker-compose.benchmark.yml --profile test run k6",
+    "metrics:start": "node metrics/system-metrics.js",
+    "report": "node metrics/generate-report.js",
+    "setup": "echo 'Setting up load testing environment...' && npm install"
+  },
+  "dependencies": {
+    "k6": "^0.0.0",
+    "pusher-js": "^8.3.0",
+    "ws": "^8.14.2",
+    "systeminformation": "^5.21.20",
+    "prom-client": "^15.0.0"
+  },
+  "devDependencies": {
+    "@types/k6": "^0.47.1"
+  }
+}

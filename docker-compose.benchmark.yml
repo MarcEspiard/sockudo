@@ -1,0 +1,147 @@
+version: '3.8'
+
+services:
+  # Redis for adapter (if using Redis adapter)
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 2gb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - benchmark-network
+
+  # Sockudo WebSocket server
+  sockudo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "6001:6001"
+      - "9601:9601"  # Prometheus metrics
+    environment:
+      - RUST_LOG=info
+      - ADAPTER_DRIVER=redis
+      - REDIS_URL=redis://redis:6379
+      - APP_MANAGER_DRIVER=memory
+      - CACHE_DRIVER=memory
+      - QUEUE_DRIVER=memory
+      - RATE_LIMITER_DRIVER=memory
+      - ENABLE_METRICS=true
+      - METRICS_PORT=9601
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6001/up/demo-app"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - benchmark-network
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  # K6 load testing tool
+  k6:
+    image: grafana/k6:latest
+    networks:
+      - benchmark-network
+    volumes:
+      - ./test/benchmarks:/scripts
+    environment:
+      - SOCKUDO_URL=ws://sockudo:6001
+      - APP_KEY=demo-app
+    command: run /scripts/scenarios/connection-test.js
+    profiles:
+      - test
+
+  # System metrics collector
+  metrics-collector:
+    build:
+      context: ./test/benchmarks
+      dockerfile: Dockerfile.metrics
+    networks:
+      - benchmark-network
+    volumes:
+      - ./test/benchmarks/results:/app/results
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - sockudo
+    environment:
+      - NODE_ENV=production
+    profiles:
+      - test
+
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus-benchmark.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=7d'
+    networks:
+      - benchmark-network
+    profiles:
+      - monitoring
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - benchmark-network
+    profiles:
+      - monitoring
+
+  # Multiple Sockudo instances for scaling tests
+  sockudo-2:
+    extends:
+      service: sockudo
+    ports:
+      - "6002:6001"
+      - "9602:9601"
+    profiles:
+      - scaling
+
+  sockudo-3:
+    extends:
+      service: sockudo
+    ports:
+      - "6003:6001"
+      - "9603:9601"
+    profiles:
+      - scaling
+
+networks:
+  benchmark-network:
+    driver: bridge
+
+volumes:
+  prometheus-data:
+  grafana-data:

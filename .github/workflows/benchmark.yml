@@ -46,7 +46,7 @@ jobs:
     outputs:
       should_run_benchmarks: ${{ steps.check.outputs.should_run }}
       base_branch: ${{ steps.check.outputs.base_branch }}
-      image_tag: ${{ steps.build.outputs.image_tag }}
+      image_tag: ${{ steps.set-outputs.outputs.image_tag }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -112,8 +112,16 @@ jobs:
           
           echo "Built image: $IMAGE_TAG"
           
-          # Output the clean image tag (must be last to avoid capturing other output)
+          # Save image tag to file for next step
+          echo "$IMAGE_TAG" > /tmp/image_tag.txt
+
+      - name: Set build outputs
+        if: steps.check.outputs.should_run == 'true'
+        id: set-outputs
+        run: |
+          IMAGE_TAG=$(cat /tmp/image_tag.txt)
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "Image tag output: $IMAGE_TAG"
 
       - name: Upload Docker image artifact
         if: steps.check.outputs.should_run == 'true'

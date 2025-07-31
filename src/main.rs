@@ -1224,6 +1224,7 @@ async fn main() -> Result<()> {
                 println!(
                     "[PRE-LOG] Successfully loaded and applied configuration from {config_path}"
                 );
+                println!("[DEBUG] Loaded metrics config: host={}, port={}", config.metrics.host, config.metrics.port);
             }
             Err(e) => {
                 eprintln!(

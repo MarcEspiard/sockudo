@@ -130,9 +130,18 @@ impl SockudoServer {
 
     fn get_metrics_addr(&self) -> SocketAddr {
         println!("[DEBUG] get_metrics_addr using: host={}, port={}", self.config.metrics.host, self.config.metrics.port);
-        format!("{}:{}", self.config.metrics.host, self.config.metrics.port)
-            .parse()
-            .unwrap_or_else(|_| "127.0.0.1:9601".parse().unwrap())
+        let addr_string = format!("{}:{}", self.config.metrics.host, self.config.metrics.port);
+        println!("[DEBUG] Attempting to parse: '{}'", addr_string);
+        match addr_string.parse() {
+            Ok(addr) => {
+                println!("[DEBUG] Successfully parsed: {}", addr);
+                addr
+            }
+            Err(e) => {
+                println!("[DEBUG] Parse failed: {}, falling back to 127.0.0.1:9601", e);
+                "127.0.0.1:9601".parse().unwrap()
+            }
+        }
     }
 
     async fn new(config: ServerOptions) -> Result<Self> {

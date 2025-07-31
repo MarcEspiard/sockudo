@@ -129,6 +129,7 @@ impl SockudoServer {
     }
 
     fn get_metrics_addr(&self) -> SocketAddr {
+        println!("[DEBUG] get_metrics_addr using: host={}, port={}", self.config.metrics.host, self.config.metrics.port);
         format!("{}:{}", self.config.metrics.host, self.config.metrics.port)
             .parse()
             .unwrap_or_else(|_| "127.0.0.1:9601".parse().unwrap())

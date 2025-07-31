@@ -1296,23 +1296,8 @@ async fn main() -> Result<()> {
         config.database.redis.key_prefix = val;
     }
 
-    // Metrics specific
-    if let Ok(val) = std::env::var("METRICS_ENABLED") {
-        config.metrics.enabled = val == "1" || val.to_lowercase() == "true";
-    }
-    if let Ok(val) = std::env::var("METRICS_HOST") {
-        config.metrics.host = val;
-    }
-    if let Ok(val_str) = std::env::var("METRICS_PORT") {
-        if let Ok(port) = val_str.parse() {
-            config.metrics.port = port;
-        } else {
-            eprintln!("[CONFIG-WARN] Failed to parse METRICS_PORT env var: '{val_str}'");
-        }
-    }
-    if let Ok(val) = std::env::var("METRICS_PROMETHEUS_PREFIX") {
-        config.metrics.prometheus.prefix = val;
-    }
+    // Note: Metrics configuration (METRICS_ENABLED, METRICS_HOST, METRICS_PORT, etc.)
+    // is already handled in config.override_from_env() above
 
     // Instance specific
     if let Ok(val) = std::env::var("INSTANCE_PROCESS_ID") {

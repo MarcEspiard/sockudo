@@ -1,0 +1,556 @@
+name: Performance Benchmarks
+
+# This workflow requires manual approval from maintainers to run.
+# To set this up:
+# 1. Go to Settings > Environments in your GitHub repository
+# 2. Create a new environment called "benchmark-approval"
+# 3. Add protection rules:
+#    - Required reviewers: Add maintainers who can approve benchmark runs
+#    - You can also add deployment branches rules if needed
+# This prevents automated benchmark runs on every PR and saves resources.
+
+on:
+  pull_request:
+    branches: [master, main]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'docker-compose.benchmark.yml'
+      - 'test/benchmarks/**'
+  push:
+    branches: [master, main]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+    inputs:
+      test_scenario:
+        description: 'Test scenario to run'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - 'all'
+          - 'connections'
+          - 'throughput'
+          - 'channels'
+          - 'scaling'
+      performance_threshold:
+        description: 'Performance regression threshold (%)'
+        required: false
+        default: '10'
+        type: string
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build and prepare for benchmarks
+  build:
+    name: Build Sockudo
+    runs-on: ubuntu-latest
+    environment: benchmark-approval
+    outputs:
+      should_run_benchmarks: ${{ steps.check.outputs.should_run }}
+      base_branch: ${{ steps.check.outputs.base_branch }}
+      image_tag: ${{ steps.set-outputs.outputs.image_tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if benchmarks should run
+        id: check
+        run: |
+          # Always require manual approval through the environment protection
+          # Workflow will pause here until approved by maintainers
+          echo "should_run=true" >> $GITHUB_OUTPUT
+          
+          # Determine base branch for comparison
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "base_branch=${{ github.base_ref }}" >> $GITHUB_OUTPUT
+          else
+            echo "base_branch=master" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.should_run == 'true'
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=moby/buildkit:buildx-stable-1
+
+      - name: Cache Docker layers
+        if: steps.check.outputs.should_run == 'true'
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'Dockerfile') }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build and cache Sockudo Docker image
+        if: steps.check.outputs.should_run == 'true'
+        id: build
+        run: |
+          # Generate unique image tag
+          IMAGE_TAG="sockudo-benchmark:${{ github.sha }}"
+          
+          # Build Sockudo with cache
+          docker buildx build \
+            --cache-from type=local,src=/tmp/.buildx-cache \
+            --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
+            --tag $IMAGE_TAG \
+            --load \
+            .
+          
+          # Move cache to avoid growing indefinitely
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache || true
+          
+          # Save image as artifact
+          docker save $IMAGE_TAG | gzip > /tmp/sockudo-image.tar.gz
+          
+          echo "Built image: $IMAGE_TAG"
+          
+          # Save image tag to file for next step
+          echo "$IMAGE_TAG" > /tmp/image_tag.txt
+
+      - name: Set build outputs
+        if: steps.check.outputs.should_run == 'true'
+        id: set-outputs
+        run: |
+          IMAGE_TAG=$(cat /tmp/image_tag.txt)
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "Image tag output: $IMAGE_TAG"
+
+      - name: Upload Docker image artifact
+        if: steps.check.outputs.should_run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sockudo-docker-image
+          path: /tmp/sockudo-image.tar.gz
+          retention-days: 1
+
+  # Run performance benchmarks
+  benchmark:
+    name: Run Performance Tests
+    runs-on: ubuntu-latest
+    needs: build
+    if: needs.build.outputs.should_run_benchmarks == 'true'
+    
+    strategy:
+      matrix:
+        test_scenario:
+          - name: "connections"
+            script: "connection-test.js"
+            timeout: 15
+          - name: "throughput"
+            script: "throughput-test.js"  
+            timeout: 10
+          - name: "channels"
+            script: "channel-test.js"
+            timeout: 12
+        
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
+        with:
+          name: sockudo-docker-image
+          path: /tmp/
+
+      - name: Load Docker image
+        run: |
+          docker load < /tmp/sockudo-image.tar.gz
+          echo "Loaded image: ${{ needs.build.outputs.image_tag }}"
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: 'test/benchmarks/package-lock.json'
+
+      - name: Cache k6 installation
+        id: cache-k6
+        uses: actions/cache@v4
+        with:
+          path: /usr/bin/k6
+          key: ${{ runner.os }}-k6-${{ hashFiles('.github/workflows/benchmark.yml') }}
+
+      - name: Install k6
+        if: steps.cache-k6.outputs.cache-hit != 'true'
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install k6
+
+      - name: Start benchmark environment
+        env:
+          SOCKUDO_IMAGE: ${{ needs.build.outputs.image_tag }}
+        run: |
+          # Update docker-compose to use pre-built image
+          # Create a temporary file with the build section replaced
+          awk -v img="$SOCKUDO_IMAGE" '
+            /^  sockudo:/ { in_sockudo=1 }
+            /^  [^ ]/ && in_sockudo && !/^  sockudo:/ { in_sockudo=0 }
+            /^    build:/ && in_sockudo { 
+              print "    image: " img
+              in_build=1
+              next
+            }
+            /^    [^ ]/ && in_build { in_build=0 }
+            !in_build { print }
+          ' docker-compose.benchmark.yml > docker-compose.benchmark.yml.tmp
+          mv docker-compose.benchmark.yml.tmp docker-compose.benchmark.yml
+          
+          # Start Sockudo with Redis backend for testing
+          docker compose -f docker-compose.benchmark.yml up -d sockudo redis
+          
+          # Wait for services to be healthy
+          timeout 60 bash -c 'until docker compose -f docker-compose.benchmark.yml exec sockudo curl -f http://localhost:6001/up/demo-app; do sleep 2; done'
+          
+          # Start system metrics collection (build metrics collector if needed)
+          docker compose -f docker-compose.benchmark.yml up -d metrics-collector
+
+      - name: Install benchmark dependencies
+        working-directory: test/benchmarks
+        run: |
+          npm ci
+          # Create results directory with proper ownership
+          rm -rf results || true
+          mkdir -p results
+          # Make sure we can write to it
+          touch results/test.txt && rm results/test.txt
+
+      - name: Verify Sockudo is running
+        run: |
+          echo "Checking if Sockudo is responding..."
+          curl -f http://localhost:6001/up/demo-app || {
+            echo "Sockudo health check failed!"
+            docker compose -f docker-compose.benchmark.yml ps
+            docker compose -f docker-compose.benchmark.yml logs sockudo || true
+            exit 1
+          }
+
+      - name: Run ${{ matrix.test_scenario.name }} benchmark
+        working-directory: test/benchmarks
+        timeout-minutes: ${{ matrix.test_scenario.timeout }}
+        env:
+          SOCKUDO_URL: ws://localhost:6001
+          APP_KEY: demo-app
+          APP_SECRET: demo-secret
+        run: |
+          echo "Running ${{ matrix.test_scenario.name }} benchmark..."
+          
+          # Run k6 test
+          k6 run scenarios/${{ matrix.test_scenario.script }} \
+            --out json=results/${{ matrix.test_scenario.name }}-raw.json
+
+      - name: Stop metrics collection
+        if: always()
+        run: |
+          # Stop metrics collector and save results
+          docker compose -f docker-compose.benchmark.yml stop metrics-collector
+          
+          # Copy metrics from container
+          docker compose -f docker-compose.benchmark.yml cp metrics-collector:/app/results/. test/benchmarks/results/ || true
+
+      - name: Collect system logs
+        if: always()
+        run: |
+          echo "=== Sockudo Logs ===" >> test/benchmarks/results/system-logs.txt
+          docker compose -f docker-compose.benchmark.yml logs sockudo >> test/benchmarks/results/system-logs.txt || true
+          
+          echo "=== Redis Logs ===" >> test/benchmarks/results/system-logs.txt
+          docker compose -f docker-compose.benchmark.yml logs redis >> test/benchmarks/results/system-logs.txt || true
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results-${{ matrix.test_scenario.name }}
+          path: test/benchmarks/results/
+          retention-days: 30
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Stop and remove all containers
+          docker compose -f docker-compose.benchmark.yml down -v --remove-orphans
+          
+          # Wait a moment for containers to fully stop
+          sleep 5
+          
+          # Force kill and remove any remaining containers using our ports
+          for port in 6001 6002 6003 6379 9090 9601 9602 9603; do
+            # Find containers using these ports and kill them
+            docker ps -q --filter "publish=$port" | xargs -r docker kill || true
+            docker ps -aq --filter "publish=$port" | xargs -r docker rm -f || true
+            
+            # Also check for containers exposing these ports
+            docker ps -q --filter "expose=$port" | xargs -r docker kill || true
+            docker ps -aq --filter "expose=$port" | xargs -r docker rm -f || true
+          done
+          
+          # Kill any sockudo containers by name pattern
+          docker ps -q --filter "name=sockudo" | xargs -r docker kill || true
+          docker ps -aq --filter "name=sockudo" | xargs -r docker rm -f || true
+          
+          docker ps -q --filter "name=redis" | xargs -r docker kill || true
+          docker ps -aq --filter "name=redis" | xargs -r docker rm -f || true
+          
+          # Clean up networks and volumes
+          docker network prune -f || true
+          docker volume prune -f || true
+          
+          # Final check - list any remaining containers
+          echo "Remaining containers:"
+          docker ps -a || true
+
+  # Scaling test (separate job due to different requirements)
+  scaling-benchmark:
+    name: Run Scaling Tests
+    runs-on: ubuntu-latest
+    needs: build
+    if: needs.build.outputs.should_run_benchmarks == 'true' && (github.event.inputs.test_scenario == 'scaling' || github.event.inputs.test_scenario == 'all' || github.event_name != 'workflow_dispatch')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
+        with:
+          name: sockudo-docker-image
+          path: /tmp/
+
+      - name: Load Docker image
+        run: |
+          docker load < /tmp/sockudo-image.tar.gz
+          echo "Loaded image: ${{ needs.build.outputs.image_tag }}"
+
+      - name: Cache k6 installation
+        id: cache-k6
+        uses: actions/cache@v4
+        with:
+          path: /usr/bin/k6
+          key: ${{ runner.os }}-k6-${{ hashFiles('.github/workflows/benchmark.yml') }}
+
+      - name: Install k6
+        if: steps.cache-k6.outputs.cache-hit != 'true'
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install k6
+
+      - name: Start scaling test environment
+        env:
+          SOCKUDO_IMAGE: ${{ needs.build.outputs.image_tag }}
+        run: |
+          # Update docker-compose to use pre-built image for all Sockudo instances
+          # Replace all build sections with image references
+          awk -v img="$SOCKUDO_IMAGE" '
+            /^  sockudo.*:/ { in_sockudo=1 }
+            /^  [^ ]/ && in_sockudo && !/^  sockudo.*:/ { in_sockudo=0 }
+            /^    build:/ && in_sockudo { 
+              print "    image: " img
+              in_build=1
+              next
+            }
+            /^    [^ ]/ && in_build { in_build=0 }
+            !in_build { print }
+          ' docker-compose.benchmark.yml > docker-compose.benchmark.yml.tmp
+          mv docker-compose.benchmark.yml.tmp docker-compose.benchmark.yml
+          
+          # Start multiple Sockudo instances with Redis cluster
+          docker compose -f docker-compose.benchmark.yml --profile scaling up -d
+          
+          # Wait for all instances to be healthy
+          for port in 6001 6002 6003; do
+            timeout 60 bash -c "until curl -f http://localhost:$port/up/demo-app; do sleep 2; done"
+          done
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: 'test/benchmarks/package-lock.json'
+
+      - name: Run scaling benchmark
+        working-directory: test/benchmarks
+        timeout-minutes: 6
+        env:
+          SOCKUDO_URL: ws://localhost:6001
+          SOCKUDO_URL_1: ws://localhost:6001
+          SOCKUDO_URL_2: ws://localhost:6002
+          SOCKUDO_URL_3: ws://localhost:6003
+          APP_KEY: demo-app
+        run: |
+          npm ci
+          # Create results directory if it doesn't exist
+          mkdir -p results || true
+          
+          # Check which instances are actually running
+          echo "Checking for running Sockudo instances..."
+          curl -s http://localhost:6001/up/demo-app && echo "Instance 1: ✓" || echo "Instance 1: ✗"
+          curl -s http://localhost:6002/up/demo-app && echo "Instance 2: ✓" || echo "Instance 2: ✗"
+          curl -s http://localhost:6003/up/demo-app && echo "Instance 3: ✓" || echo "Instance 3: ✗"
+          
+          k6 run scenarios/scaling-test.js --out json=results/scaling-raw.json
+
+      - name: Upload scaling results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results-scaling
+          path: test/benchmarks/results/
+          retention-days: 30
+
+      - name: Cleanup scaling environment
+        if: always()
+        run: |
+          docker compose -f docker-compose.benchmark.yml --profile scaling down -v --remove-orphans
+          
+          # Wait for containers to stop
+          sleep 5
+          
+          # Force cleanup any remaining containers
+          for port in 6001 6002 6003 6379 9090 9601 9602 9603; do
+            docker ps -q --filter "publish=$port" | xargs -r docker kill || true
+            docker ps -aq --filter "publish=$port" | xargs -r docker rm -f || true
+            docker ps -q --filter "expose=$port" | xargs -r docker kill || true
+            docker ps -aq --filter "expose=$port" | xargs -r docker rm -f || true
+          done
+          
+          docker system prune -f
+
+  # Analyze results and detect performance regressions
+  analyze:
+    name: Analyze Performance Results
+    runs-on: ubuntu-latest
+    needs: [build, benchmark, scaling-benchmark]
+    if: always() && (needs.benchmark.result == 'success' || needs.scaling-benchmark.result == 'success')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: 'test/benchmarks/package-lock.json'
+
+      - name: Download all benchmark results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: benchmark-results-*
+          path: benchmark-artifacts/
+          merge-multiple: true
+
+      - name: Install analysis dependencies
+        working-directory: test/benchmarks
+        run: npm ci
+
+      - name: Generate performance report
+        working-directory: test/benchmarks
+        run: |
+          node metrics/generate-report.js ../../benchmark-artifacts/ > performance-report.md
+
+      - name: Check for performance regressions
+        id: regression_check
+        working-directory: test/benchmarks
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGRESSION_THRESHOLD: ${{ github.event.inputs.performance_threshold || '10' }}
+          BASE_BRANCH: ${{ needs.build.outputs.base_branch }}
+        run: |
+          # This would compare with baseline metrics from the base branch
+          # For now, we'll just check if critical thresholds are met
+          
+          EXIT_CODE=0
+          
+          # Check connection test results
+          if [ -f "../../benchmark-artifacts/connection-test-results.json" ]; then
+            SUCCESS_RATE=$(jq -r '.connections.successRate' ../../benchmark-artifacts/connection-test-results.json 2>/dev/null || echo "0")
+            if (( $(echo "$SUCCESS_RATE < 0.95" | bc -l) )); then
+              echo "⚠️ Connection success rate below threshold: $SUCCESS_RATE < 0.95"
+              EXIT_CODE=1
+            fi
+          fi
+          
+          # Check throughput test results  
+          if [ -f "../../benchmark-artifacts/throughput-test-results.json" ]; then
+            MSG_PER_SEC=$(jq -r '.throughput.avgMessagesPerSecond' ../../benchmark-artifacts/throughput-test-results.json 2>/dev/null || echo "0")
+            if (( $(echo "$MSG_PER_SEC < 1000" | bc -l) )); then
+              echo "⚠️ Message throughput below threshold: $MSG_PER_SEC < 1000 msg/sec"
+              EXIT_CODE=1
+            fi
+          fi
+          
+          echo "regression_detected=$EXIT_CODE" >> $GITHUB_OUTPUT
+          exit $EXIT_CODE
+
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let comment = '## 🚀 Performance Benchmark Results\n\n';
+            
+            try {
+              const report = fs.readFileSync('test/benchmarks/performance-report.md', 'utf8');
+              comment += report;
+            } catch (error) {
+              comment += '❌ Could not generate performance report\n';
+            }
+            
+            // Add artifacts info
+            comment += '\n### 📊 Detailed Results\n';
+            comment += 'Detailed benchmark results are available as workflow artifacts.\n';
+            
+            // Add regression warning if detected
+            if ('${{ steps.regression_check.outputs.regression_detected }}' === '1') {
+              comment = '⚠️ **Performance Regression Detected** ⚠️\n\n' + comment;
+            }
+            
+            comment += '\n---\n*Automated performance testing powered by k6 and GitHub Actions*';
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Upload performance report
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-report
+          path: |
+            test/benchmarks/performance-report.md
+            benchmark-artifacts/
+          retention-days: 90
+
+      - name: Fail if regression detected
+        if: steps.regression_check.outputs.regression_detected == '1'
+        run: |
+          echo "Performance regression detected! Check the results above."
+          exit 1

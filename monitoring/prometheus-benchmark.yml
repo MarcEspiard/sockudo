@@ -1,0 +1,32 @@
+global:
+  scrape_interval: 5s  # More frequent scraping for benchmarks
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Sockudo metrics
+  - job_name: 'sockudo'
+    static_configs:
+      - targets: ['sockudo:9601']
+        labels:
+          instance: 'sockudo-1'
+      
+  # Additional Sockudo instances for scaling tests
+  - job_name: 'sockudo-scaling'
+    static_configs:
+      - targets: ['sockudo-2:9601', 'sockudo-3:9601']
+        labels:
+          group: 'scaling'
+    
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+      
+  # Docker metrics (if available)
+  - job_name: 'docker'
+    static_configs:
+      - targets: ['host.docker.internal:9323']
+    
+# Benchmark-specific recording rules
+rule_files:
+  - /etc/prometheus/benchmark_rules.yml

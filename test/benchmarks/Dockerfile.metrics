@@ -1,0 +1,24 @@
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apk add --no-cache \
+    procps \
+    htop \
+    curl
+
+# Copy package files
+COPY package.json package-lock.json ./
+
+# Install dependencies
+RUN npm ci --production
+
+# Copy metrics collector
+COPY metrics/ ./metrics/
+
+# Create results directory
+RUN mkdir -p /app/results
+
+# Run metrics collector
+CMD ["node", "metrics/system-metrics.js"]
